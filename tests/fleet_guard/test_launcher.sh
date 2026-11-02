@@ -22,6 +22,16 @@ signal.signal(signal.SIGUSR1, save)
 open(os.environ['READY'], 'w').write('ready')
 time.sleep(60)
 EOF
+cat > "$T/fg.py" <<'EOF'
+# a program that does not handle SIGUSR1: once running (after $WAIT_FOR exists, if set) it writes $READY, then sleeps
+import os, time
+w = os.environ.get('WAIT_FOR')
+for _ in range(400):
+    if not w or os.path.exists(w): break
+    time.sleep(0.05)
+open(os.environ['READY'], 'w').write('ready')
+time.sleep(30)
+EOF
 spec(){ python3 - "$T/$1.json" "${@:2}" <<'EOF'
 import json, sys
 out, tasks = sys.argv[1], sys.argv[2:]
@@ -47,7 +57,7 @@ echo "K2. a single command, the shape that always worked: still a checkpoint seg
 spec c2 "$T|python3 $T/ckpt.py"; usr1run c2
 check "exit 0, saved, a checkpoint segment" '[ "$RC" = 0 ] && [ "$SAVED_AT_EXIT" = yes ] && [ "$(rj "$T/c2/receipt.json" "r[\"checkpoint_segment\"] is True")" = True ]'
 echo "K3. a program that does not handle SIGUSR1, in a compound command: it dies of the signal, nothing more runs, not a checkpoint"
-spec c3 "$T|touch \$READY; sleep 30; echo post"; usr1run c3
+spec c3 "$T|python3 $T/fg.py; echo post"; usr1run c3
 check "exit 1, promptly; the task's exit is 138 (128 + SIGUSR1); not a checkpoint segment; no post" '[ "$RC" = 1 ] && python3 -c "import sys; sys.exit(0 if $WAITED < 5 else 1)" && [ "$(rj "$T/c3/receipt.json" "r[\"tasks\"][0][\"exit\"]==138 and r[\"checkpoint_segment\"] is False")" = True ] && ! grep -q post "$T/c3/t0.out"'
 echo "K4. a task whose folder does not exist: refused before anything starts"
 spec l1 "$T|echo \$\$ > $T/l1.pid; exec sleep 30" "$T/no-such-folder|sleep 1"
@@ -60,4 +70,13 @@ check "exit 1 within the grace, a LAUNCH FAILED line" '[ "$RC" = 1 ] && grep -q 
 check "receipt: launch_error names t1 (not started), all_ok false, the started task recorded with a non-zero exit" '[ "$(rj "$T/l2/receipt.json" "r[\"launch_error\"][\"task\"]==\"t1\" and r[\"launch_error\"][\"not_started\"]==[\"t1\"] and r[\"all_ok\"] is False and len(r[\"tasks\"])==1 and r[\"tasks\"][0][\"exit\"]!=0")" = True ]'
 P=$(rj "$T/l2/receipt.json" "r[\"tasks\"][0][\"pid\"]")
 check "nothing of the started task is left (its process group is empty)" '[ -n "$P" ] && ! pgrep -g "$P" >/dev/null'
+echo "K6. a program started with & and waited for (program & wait \$!): the interrupted wait is waited again, the save counts"
+spec c6 "$T|python3 $T/ckpt.py & wait \$!"; usr1run c6
+check "exit 0, saved, the task's exit 0, a checkpoint segment" '[ "$RC" = 0 ] && [ "$SAVED_AT_EXIT" = yes ] && [ "$(rj "$T/c6/receipt.json" "r[\"tasks\"][0][\"exit\"]==0 and r[\"checkpoint_segment\"] is True")" = True ]'
+echo "K7. the same form with a program that does not handle the signal: it dies of it, exit 138, not a checkpoint"
+spec c7 "$T|python3 $T/fg.py & wait \$!"; usr1run c7
+check "exit 1, the task's exit 138, not a checkpoint segment" '[ "$RC" = 1 ] && [ "$(rj "$T/c7/receipt.json" "r[\"tasks\"][0][\"exit\"]==138 and r[\"checkpoint_segment\"] is False")" = True ]'
+echo "K8. a background program that saves beside a foreground one that dies of the signal: the failure is not masked"
+spec c8 "$T|READY=\$READY.bg python3 $T/ckpt.py & WAIT_FOR=\$READY.bg python3 $T/fg.py"; usr1run c8
+check "exit 1, the task's exit 138, the background save still waited for" '[ "$RC" = 1 ] && [ "$SAVED_AT_EXIT" = yes ] && [ "$(rj "$T/c8/receipt.json" "r[\"tasks\"][0][\"exit\"]==138")" = True ]'
 echo "LAUNCHER RESULT: $PASS passed, $FAILS failed"; [ "$FAILS" = 0 ]

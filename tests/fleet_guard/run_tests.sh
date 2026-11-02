@@ -154,6 +154,12 @@ reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; echo "702|two-x-v1|COMPLETED|10|7
 check "a two-node job with both nodes' receipts all ok: exit 0, both receipts named" '[ $RCW = 0 ] && [ $(echo "$OUTW" | grep -o "node-[01]/receipt.json" | sort -u | wc -l) = 2 ]'
 rm -rf "$T/rcpt/two-x-v1-702/node-1"; wj 702
 check "the same job with one node's receipt missing: exit 1, the missing receipt named" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "missing: .*node-1/receipt.json"'
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "800|ok-x-v1|COMPLETED|10|800|1" "801|bad-x-v1|FAILED|10|801|1" > "$FAKE/sacct.txt"
+printf '%s\n' "800|ok-x-v1|COMPLETED|10|800|1" > "$FAKE/sacct.2.txt"; echo 1 > "$FAKE/sacct.2.rc"; rcpt ok-x-v1-800; rcpt bad-x-v1-801 false; wj "800 801"
+check "a later accounting read that fails and leaves out a failed job: the report comes from the read that ended the wait, 801 FAILED, exit 1" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "^job 801 bad-x-v1 FAILED"'
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "800|ok-x-v1|COMPLETED|10|800|1" > "$FAKE/sacct.txt"; touch "$FAKE/sacct_fail"; wj 800 6
+check "accounting failing: a failed read is no answer, it keeps waiting" '[ $RCW = 124 ]'
+rm -f "$FAKE/sacct_fail"
 
 echo "17. the queue file is pruned and the dispatcher stays quiet when nobody waits"
 reset; job 101; job 102; job 103; job 104; sub --name alpha-prune-a; QA=$OUT; sub --name alpha-prune-b; QB=$OUT
@@ -216,7 +222,7 @@ reset; setcap race 4
 wait
 check "two concurrent 4 GPU-hour jobs under a 4 GPU-hour cap: one submitted, the other refused by the budget (exit 3)" '[ "$(cat "$T/rc_a" "$T/rc_b" | sort | tr "\n" " ")" = "0 3 " ] && [ $(calls | wc -l) = 1 ]'
 reset; setcap race 4; sub --name race-a-v1; A=$OUT
-check "the accepted job leaves a reservation of its worst case (one node at once, not held)" 'grep -q "|$A|race|4.0|01:00:00|race-a-v1|1|0$" "$FLEET_RESERVATIONS_FILE"'
+check "the accepted job leaves a reservation of its worst case (one node at once, not held, one task)" 'grep -q "|$A|race|4.0|01:00:00|race-a-v1|1|0|1|$" "$FLEET_RESERVATIONS_FILE"'
 : > "$FAKE/jobs.txt"; sub --name race-b-v1
 check "while neither the queue nor accounting shows the first job, its reservation counts: refused (exit 3)" '[ $RC = 3 ] && grep -q "|$A|" "$FLEET_RESERVATIONS_FILE"'
 printf '%s\n' "$A|race-a-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED" > "$FAKE/sacct.txt"; rm -f "$STAGE"/receipts/.budget_cache.*.json
@@ -296,6 +302,11 @@ check "the deliberate override, --over-cap-ok, still submits without a caps file
 reset; rm -f "$STAGE/caps.json"; J=$(python3 "$STAGE/slurm/budget.py" --site test --json 2>/dev/null); JRC=$?
 check "the table without a caps file still works (exit 0, JSON)" '[ $JRC = 0 ] && echo "$J" | python3 -c "import json,sys; json.load(sys.stdin)"'
 cp "$T/caps.saved" "$STAGE/caps.json"
+reset; sub --name -oops
+check "a job name with an empty lane tag (-oops): refused (exit 2), sbatch never called" '[ $RC = 2 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "has no lane tag"'
+python3 "$STAGE/slurm/budget.py" --site test --lane '' --est-hours 4 >/dev/null 2>"$T/state/b.err"; BRC=$?
+check "the budget check asked about an empty lane tag: refused (exit 3), not read as a plain table" '[ $BRC = 3 ] && grep -q "an empty lane tag" "$T/state/b.err"'
+cp "$T/caps.saved" "$STAGE/caps.json"
 
 echo "25. the launcher's task shell under the checkpoint signal, and a task that cannot start: tests/fleet_guard/test_launcher.sh"
 if TMPDIR="$T" bash "$HERE/test_launcher.sh" "$TOOLING/pack_node.py" > "$T/la.out" 2>&1; then ok "launcher suite: $(tail -1 "$T/la.out")"; else bad "launcher suite: $(tail -1 "$T/la.out")"; cat "$T/la.out"; fi
@@ -303,7 +314,32 @@ if TMPDIR="$T" bash "$HERE/test_launcher.sh" "$TOOLING/pack_node.py" > "$T/la.ou
 echo "26. lanegit's shared-index update: tests/fleet_guard/test_lanegit.sh"
 if TMPDIR="$T" bash "$HERE/test_lanegit.sh" "$TOOLING/git/lanegit.sh" > "$T/lg.out" 2>&1; then ok "lanegit suite: $(tail -1 "$T/lg.out")"; else bad "lanegit suite: $(tail -1 "$T/lg.out")"; cat "$T/lg.out"; fi
 
-echo "27. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "27. a reservation stays until accounting has the job: accepted, queued, ended and gone from the queue, then reconciled"
+rbudget(){ python3 "$STAGE/slurm/budget.py" --site test --json 2>/dev/null | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin) if x["lane"]==sys.argv[1]]; print(round(r[0]["used"]+r[0]["committed"],3) if r else 0)' "$1"; }
+reset; setcap race 4; sub --name race-a-v1; A=$OUT; sub --name race-b-v1
+check "accepted, then queued: a second 4 GPU-hour job refused (exit 3), the first one's reservation still on file, with its task count and when the queue showed it" '[ $RC = 3 ] && grep -q "|$A|race|4.0|01:00:00|race-a-v1|1|0|1|20[0-9-]*T[0-9:]*Z$" "$FLEET_RESERVATIONS_FILE"'
+: > "$FAKE/jobs.txt"; sub --name race-c-v1
+check "ended and gone from the queue, accounting without a record yet: its 4 GPU-hours still count, the next job refused (exit 3; the review's case)" '[ $RC = 3 ] && grep -q "|$A|" "$FLEET_RESERVATIONS_FILE"'
+printf '%s\n' "$A|race-a-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED" > "$FAKE/sacct.txt"; rm -f "$STAGE"/receipts/.budget_cache.*.json; sub --name race-d-v1
+check "accounting has it, finished, 4 GPU-hours: the reservation retired, the used hours hold the cap (refused, exit 3)" '[ $RC = 3 ] && ! grep -q "|$A|" "$FLEET_RESERVATIONS_FILE"'
+reset; setcap race 8; sub --name race-e-v1; E=$OUT
+sed -i "s/^$E|$E|1|PD|.*/$E|$E|1|R|(null)|None|2026-11-02T10:00:00|race-e-v1|1:00:00|30:00/" "$FAKE/jobs.txt"
+echo "$E|race-e-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|1800|RUNNING" > "$FAKE/sacct.txt"; rm -f "$STAGE"/receipts/.budget_cache.*.json
+check "a running job counted once: half an hour used, half an hour left, its reservation adds nothing (4 GPU-hours in all)" '[ "$(rbudget race)" = 4.0 ]'
+reset; setcap race 100; mkdir -p "$T/arr3"; for i in 0 1 2; do cp "$T/spec.json" "$T/arr3/node_$i.json"; done
+Q=$(bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --array 0-2%1 --spec-dir "$T/arr3" --name race-arr-v1 2>/dev/null)
+check "an array's reservation records its three tasks (12 GPU-hours)" 'grep -q "|$Q|race|12.0|01:00:00|race-arr-v1|1|0|3|$" "$FLEET_RESERVATIONS_FILE"'
+: > "$FAKE/jobs.txt"; echo "${Q}_0|race-arr-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED" > "$FAKE/sacct.txt"; rm -f "$STAGE"/receipts/.budget_cache.*.json
+check "the array gone from the queue, accounting with one element of three: 4 used and 8 still reserved (12 in all)" '[ "$(rbudget race)" = 12.0 ]'
+printf '%s\n' "${Q}_0|race-arr-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED" "${Q}_1|race-arr-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|1800|COMPLETED" "${Q}_2|race-arr-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|1800|COMPLETED" > "$FAKE/sacct.txt"
+rm -f "$STAGE"/receipts/.budget_cache.*.json; FLEET_LOCK_HELD=1 python3 "$STAGE/slurm/budget.py" --site test --json >/dev/null 2>&1
+check "accounting has all three elements: the reservation retired, the 8 GPU-hours used are what counts" '! grep -q "|$Q|" "$FLEET_RESERVATIONS_FILE" && [ "$(rbudget race)" = 8.0 ]'
+reset; setcap race 4; echo "$(date -u -d "-5 days" +%FT%TZ)|77777|race|4.0|01:00:00|race-long-v1|1|0|1|$(date -u -d "-2 hours" +%FT%TZ)" > "$FLEET_RESERVATIONS_FILE"; sub --name race-f-v1
+check "a job submitted five days ago that the queue showed two hours ago, not yet in accounting: its reservation still counts (refused, exit 3)" '[ $RC = 3 ] && grep -q "|77777|" "$FLEET_RESERVATIONS_FILE"'
+echo "$(date -u -d "-5 days" +%FT%TZ)|77777|race|4.0|01:00:00|race-long-v1|1|0|1|$(date -u -d "-2 days" +%FT%TZ)" > "$FLEET_RESERVATIONS_FILE"; sub --name race-g-v1
+check "the same, last shown two days ago and still nowhere: it expires, loudly, and the job is accepted" '[ $RC = 0 ] && ! grep -q "|77777|" "$FLEET_RESERVATIONS_FILE" && echo "$ERR" | grep -q "expired"'
+
+echo "28. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"

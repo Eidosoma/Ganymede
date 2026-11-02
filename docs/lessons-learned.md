@@ -20,6 +20,10 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **A failing suite looked green.** Found in the same review, and reproduced: the test runner printed its failures and exited 0, so a script or CI that reads only the exit status saw success. *Rule:* a suite ends on its failure count; the exit status is part of the result.
 
+**Seen is not settled.** Found in a second review, and reproduced: a reservation was dropped as soon as the queue showed its job, so a job that finished and left the queue before accounting had its record counted nothing, and its hours could be spent again. *Rule:* a reservation lives until accounting has every task of its job; until then the job counts as the larger of its worst case and what the queue and accounting show.
+
+**A failed read is not an answer.** Found in the same review, and reproduced: the waiter read accounting a second time to report, that read could fail and come back partial, and a failed job missing from it turned the result into success. *Rule:* a read whose exit status is not 0 is no picture of anything; report from the read you trusted.
+
 **Silence read as zero.** A failed `squeue` looked like an empty queue, so a waiter returned while the job was still running, and a budget check could read "nothing used". *Rule:* every tool fails closed. A wrapper that cannot read the queue submits nothing; a budget check that cannot read accounting refuses; a waiter believes an empty queue only when accounting shows the job has ended.
 
 **A full fleet made agents retry.** The first ceiling refused jobs when the fleet was full, and the agent had to come back later. Agents that come back later are agents that loop. *Rule:* accept and hold. The job is queued and released first in first out by a dispatcher that runs at every job's end and every submission.

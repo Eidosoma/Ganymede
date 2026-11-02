@@ -2,7 +2,7 @@
 
 ## 0.1.0 (unreleased)
 
-The first public release, extracted from the tooling of a fleet of AI agents supporting research and development on JUPITER Booster (internal version 1.3.15, 2 November 2026).
+The first public release, extracted from the tooling of a fleet of AI agents supporting research and development on JUPITER Booster (internal version 1.3.16, 2 November 2026).
 
 Included: the node launcher (`pack_node.py`), the submit wrapper and its guards, the fleet queue and dispatcher, the budget check, the waiter, the status screens, the allocation ledger, the copy-back helper, the git tools (`lanegit.sh`, `ffscoped.py`) and size hooks, the probes, example specs, agent instruction templates, the test suite with its fake Slurm, and the documentation.
 
@@ -19,14 +19,15 @@ Changed for the public release:
 - The NVML bindings are a dependency (`nvidia-ml-py`) instead of a vendored copy.
 - `probes/` (formerly the calibration lane's folder); a generic smoke test.
 - The tests use their own site file and neutral lane tags.
-- The suite runs in CI (`.github/workflows/tests.yml`); `git/lanegit.sh` and `git/ffscoped.py` are executable, as the docs run them; the login check counts the GPU memory you hold already.
+- The suite runs in CI (`.github/workflows/tests.yml`); `git/lanegit.sh` and `git/ffscoped.py` are executable, as the docs run them; the login check counts the GPU memory you hold already, and its test does not depend on who runs it.
 
-New in the public release: `tools/login_check.py` and `docs/login-nodes.md`, the fleet's login-node practice as a tool and a page: look before you run (load, least-busy cores, memory against the per-user limit, other users on the login GPU), then run with what the check allows. Tested by `tests/fleet_guard/test_login_check.sh` (run_tests.sh section 27).
+New in the public release: `tools/login_check.py` and `docs/login-nodes.md`, the fleet's login-node practice as a tool and a page: look before you run (load, least-busy cores, memory against the per-user limit, other users on the login GPU), then run with what the check allows. Tested by `tests/fleet_guard/test_login_check.sh` (run_tests.sh section 28).
 
 ## Internal history
 
 The versions below were the internal releases during the first deployment, September to November 2026.
 
+- **1.3.16**: a reservation stays until accounting has reconciled its job (an array element by element), counted once beside the queue and accounting, so a job that ends before its record reaches accounting still counts; a failed accounting read is never the waiter's answer; an empty lane tag is refused; a checkpoint signal that interrupts the task shell's own `wait` waits again for the program, and a child that inherited the shell's trap dies of the signal (found in a second review of this release).
 - **1.3.15**: the suite's exit status fails when a check fails; the launcher's task shell outlives the checkpoint signal (a compound command checkpoints like a single one; a program killed by signal N reads exit 128+N); the idle watchdog needs a reading for every GPU (a slot not read counts as active); a missing task folder is refused before anything starts, and a task that cannot start stops the others and leaves a receipt; the waiter follows arrays element by element and needs every node's receipt; lanegit sets the shared index to the committed versions and folder commits take staged changes; the NCCL probe leaves its training loop on a collective decision and compares parameters bit for bit (all found in a review of this release).
 - **1.3.14**: the scoped fast-forward never overwrites or deletes a write made while it runs: each file is moved aside and checked again, origin's version is linked in only where nothing appeared, and a change after the check is put back or kept and stops the round before main moves; files must be quiet for a minute, and the dry run lists the paths whose writers pause. A submission needs a valid caps file and a finite, non-negative cap for its lane (both found in a review of this release: an edit made during an update was silently overwritten, and a missing caps file let every lane run uncapped).
 - **1.3.13**: the node ceiling counts the pending part of an array by the elements its throttle lets run at once, through one helper shared by the wrapper and the dispatcher (`slurm/inflight.py`) that reads whole task lists; accepted jobs that the queue does not show yet count from their reservations (found in a review of this release: a pending array counted as one node, so a fleet could start more nodes than its ceiling; the budget half, a pending array charged as one task, was fixed in 1.3.12).

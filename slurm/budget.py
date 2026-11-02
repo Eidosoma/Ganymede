@@ -45,6 +45,15 @@ def windows(start, now, days):
     while ws<now:
         we=min(ws+dt.timedelta(days=days),now); out.append((ws,we)); ws=we
     return out
+def count_elements(task):
+    """How many array elements the task part of an accounting JobID names: '' or '3' one; '[5-9]' five; '[1,3,7-9%2]' five."""
+    if not task.startswith('['): return 1
+    n=0
+    for part in task.strip('[]').split('%')[0].split(','):
+        a,_,b=part.partition('-')
+        try: n+=(int(b.split(':')[0])-int(a)+1) if b else 1
+        except ValueError: n+=1
+    return max(n,1)
 def used_by_lane(env, site, per_node, charge, since, read, no_cache=False):
     """GPU-hours per lane from accounting, for the site's ACCOUNT only (sacct -a -A: every user of the account, nobody else's jobs).
     The period is read in UTC windows of BUDGET_WINDOW_DAYS (7), so no single reply grows large (the accounting database cut off
@@ -113,8 +122,9 @@ def main():
     ap.add_argument('--json',action='store_true'); ap.add_argument('--no-cache',action='store_true',help='read every accounting window again'); a=ap.parse_args()
     env=site_env(a.site); per_node=int(env.get('GPUS_PER_NODE','4')); charge=env.get('CHARGE_WHOLE_NODES','1')=='1'; since=env.get('BUDGET_SINCE','now-30days')
     caps,bad_caps,caps_problem=load_caps(os.path.join(JDIR,'caps.json'))
-    if a.lane:   # a submission: a valid caps file and a usable cap for its lane, checked before accounting is read
-        if caps_problem: why=caps_problem
+    if a.lane is not None:   # a submission (an empty tag included): a valid caps file and a usable cap for its lane, checked first
+        if a.lane=='': why="an empty lane tag: a job name must start with its lane's tag and a hyphen"
+        elif caps_problem: why=caps_problem
         elif a.lane in bad_caps: why=f"lane '{a.lane}' has no usable cap in caps.json ({bad_caps[a.lane]!r}): a cap must be a finite, non-negative number of GPU-hours"
         elif a.lane not in caps: why=f"lane '{a.lane}' has no cap in caps.json (known lanes: {', '.join(sorted(caps)) or 'none'}); a job name must start with its lane tag (for example alpha-...; the part before the first '-')"
         else: why=None
@@ -129,35 +139,50 @@ def main():
         if r is None or r.returncode!=0:
             msg=f"BUDGET: `{cmd[0]}` failed ({err if r is None else (r.stderr.strip() or 'exit '+str(r.returncode))[:200]}); the budget cannot be verified"
             print(msg,file=sys.stderr)
-            if a.lane: sys.exit(3)
+            if a.lane is not None: sys.exit(3)
             return None if none_on_failure else ''
         return r.stdout
     used,acct_jobs=used_by_lane(env,a.site,per_node,charge,since,lambda cmd: read(cmd,none_on_failure=True),a.no_cache)
-    com={}; counts={}; qids=set()
+    com={}; counts={}; qids=set(); qcom={}
     acct=env.get('ACCOUNT','')   # the whole account's queue, one line per array task (-r): a pending array is counted task by task
     out=read(['squeue','-h','-r']+(['-A',acct] if acct else ['-u',os.environ.get('USER','')])+['-o','%i|%j|%t|%l|%M|%D|%b'])
     for l in out.strip().splitlines():
         jid,name,st,lim,el,nodes,tres=l.split('|')[:7]; lane=name.split('-')[0]; nodes=int(nodes or 1); qids.add(jid.split('_')[0])
         g=gpus_of(tres,nodes,per_node,charge,per_node_fmt=True); rem=max(0,dur(lim)-(dur(el) if st=='R' else 0))
-        com[lane]=com.get(lane,0)+g*rem/3600; c=counts.setdefault(lane,{'R':0,'PD':0,'other':0}); c[st if st in ('R','PD') else 'other']+=1
-    # Reservations: an accepted submission's worst case counts as committed until the queue or accounting shows the job, so a job that
-    # is missing from one snapshot (just accepted, or just ended and not yet in accounting) is never free headroom. A reservation is
-    # dropped when the job's id is in the queue or finished in accounting, or, never seen by either, a day after its time limit.
+        qcom[jid.split('_')[0]]=qcom.get(jid.split('_')[0],0)+g*rem/3600; com[lane]=com.get(lane,0)+g*rem/3600; c=counts.setdefault(lane,{'R':0,'PD':0,'other':0}); c[st if st in ('R','PD') else 'other']+=1
+    # Reservations: an accepted submission's worst case stays on file until accounting has reconciled the job, every one of its tasks
+    # finished there. Until then the job counts as the larger of that worst case and what the queue and accounting already show for it:
+    # never twice and never nothing, whether it is only accepted, queued, running, or ended and gone from the queue before its record
+    # reaches accounting. (A reservation used to be dropped as soon as the queue showed its job, so a job that ended before accounting
+    # had it counted nothing, and one finished element retired a whole array: the second review of the public release.) A reservation
+    # whose job neither the queue nor accounting shows, a day after its time limit and a day after the queue last showed it, expires,
+    # loudly. Lines: UTC|job|lane|GPU-h|limit|name|nodes at once|held or chained|tasks|when the queue last showed the job.
     rpath=os.environ.get('FLEET_RESERVATIONS_FILE') or resolve(env.get('FLEET_RESERVATIONS_FILE','')) or os.path.join(JDIR,'receipts','FLEET_RESERVATIONS.log')
-    done_ids={j.split('_')[0] for j,v in acct_jobs.items() if v[2].startswith(TERMINAL)}; seen_ids={j.split('_')[0] for j in acct_jobs}
+    acct_base={}   # base id -> [GPU-hours accounting shows, elements it shows finished]
+    for jid,v in acct_jobs.items():
+        b,_,t=jid.partition('_'); e=acct_base.setdefault(b,[0.0,0]); e[0]+=v[1]
+        if v[2].startswith(TERMINAL): e[1]+=count_elements(t)
     try: rlines=open(rpath).read().splitlines()
     except FileNotFoundError: rlines=[]
-    keep=[]; res={}; nowts=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    keep=[]; res={}; nowts=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None,microsecond=0)
+    def when(s):
+        try: return dt.datetime.strptime(s,'%Y-%m-%dT%H:%M:%SZ')
+        except ValueError: return None
     for l in rlines:
         f=l.split('|')
         if len(f)<5: continue
-        base=f[1].split(';')[0].split('_')[0]
-        if base in qids or base in done_ids: continue
-        try: age=(nowts-dt.datetime.strptime(f[0],'%Y-%m-%dT%H:%M:%SZ')).total_seconds()
-        except ValueError: age=0
-        if age>dur(f[4])+86400 and base not in seen_ids:
-            print(f"BUDGET: reservation {f[1]} ({f[2]}, {f[3]} GPU-h) expired: a day past its time limit and never seen in the queue or accounting",file=sys.stderr); continue
-        keep.append(l); res[f[2]]=res.get(f[2],0)+float(f[3] or 0)
+        f=f+['']*(10-len(f)); base=f[1].split(';')[0].split('_')[0]
+        tasks=int(f[8]) if f[8].isdigit() and int(f[8])>0 else 1
+        used_j,done_j=acct_base.get(base,(0.0,0)); inq=base in qids
+        if not inq and done_j>=tasks: continue                         # reconciled: every task finished in accounting, where it counts now
+        if inq: f[9]=nowts.strftime('%Y-%m-%dT%H:%M:%SZ')              # the queue shows it now
+        elif base not in acct_base:
+            t0=when(f[0]) or nowts; last=when(f[9])
+            if nowts>max(t0+dt.timedelta(seconds=dur(f[4])),last or t0)+dt.timedelta(days=1):
+                print(f"BUDGET: reservation {f[1]} ({f[2]}, {f[3]} GPU-h) expired: neither the queue nor accounting shows the job, a day after its time limit"
+                      +(" and a day after the queue last showed it" if last else ''),file=sys.stderr); continue
+        keep.append('|'.join(f))
+        res[f[2]]=res.get(f[2],0)+max(0.0,float(f[3] or 0)-used_j-qcom.get(base,0.0))   # what the queue and accounting do not show yet
     for lane,h in res.items(): com[lane]=com.get(lane,0)+h
     if os.environ.get('FLEET_LOCK_HELD')=='1' and keep!=rlines:   # only a holder of the fleet lock rewrites the file
         try:
@@ -173,7 +198,7 @@ def main():
     else:
         print(f"{'lane':8s} {'used':>9s} {'committed':>10s} {'cap':>7s} {'headroom':>9s}  R/PD")
         for r in rows: print(f"{r['lane']:8s} {r['used']:9.2f} {r['committed']:10.2f} {str(r['cap'] or '-'):>7s} {str(r['headroom'] if r['headroom'] is not None else '-'):>9s}  {r['queue']['R']}/{r['queue']['PD']}")
-    if a.lane:
+    if a.lane is not None:
         cap=caps[a.lane]   # checked at the start: present, finite, non-negative
         if used.get(a.lane,0)+com.get(a.lane,0)+a.est_hours>cap:
             print(f"BUDGET: lane {a.lane} would exceed its cap {cap}: used {used.get(a.lane,0):.2f} + committed {com.get(a.lane,0):.2f} + this job {a.est_hours:.2f}",file=sys.stderr); sys.exit(3)

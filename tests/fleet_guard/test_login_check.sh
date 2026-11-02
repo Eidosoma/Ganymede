@@ -38,12 +38,15 @@ echo "L5. read-only"
 check "nothing written beside it but the test's own output" '[ "$(ls -A "$T" | sort | tr "\n" " ")" = "err.txt out.json " ]'
 
 echo "L6. the login GPU: what you hold already counts (a fake nvidia-smi: 10 GiB of yours on the card, someone else there too)"
+# "Someone else" is a PID that cannot exist (above any pid_max): its owner cannot be read, so the tool counts it as another user's,
+# whoever runs the suite. (PID 1 was used first; run as root, PID 1 is the caller's own, and the sum read 22 GiB.)
+OTHER=99999999; [ ! -e /proc/$OTHER ] || { echo "PID $OTHER exists here; pick another"; exit 2; }
 F=$(mktemp -d "${TMPDIR:-/tmp}/lc_gpu.XXXXXX"); mkdir -p "$F/bin"
 cat > "$F/bin/nvidia-smi" <<EOF
 #!/bin/bash
 case "\$*" in
   *--query-gpu=*) echo "0, 12288, 97871, 30";;
-  *--query-compute-apps=*) echo "$$, 10240"; echo "1, 2048";;
+  *--query-compute-apps=*) echo "$$, 10240"; echo "$OTHER, 2048";;
 esac
 EOF
 chmod +x "$F/bin/nvidia-smi"

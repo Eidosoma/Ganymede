@@ -47,8 +47,15 @@ def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 # The task shell outlives the forwarded signal. SIGUSR1 and SIGTERM go to the task's whole process group; a shell that is still a
 # parent (a compound command such as "python train.py; echo done") used to die of the signal at once, so the launcher stopped waiting
 # while the program was still saving. With this trap the shell waits for the running command, then exits with its status and starts
-# nothing more. (A program killed by signal N reads exit 128+N; a single command that the shell used to replace read -N.)
-TASK_SHELL = "trap '__pk_rc=$?; wait; exit $__pk_rc' USR1 TERM\n"
+# nothing more. (A program killed by signal N reads exit 128+N; a single command that the shell used to replace read -N.) When the
+# signal interrupts the shell's own `wait` (a program started with & and waited for), the shell waits again for the same program and
+# takes its status: the interrupted wait's 128+N is not the program's. A foreground program that died of the signal still reads 128+N.
+# A child of the shell that inherited the trap (forked for `program &` and signalled before it became the program) resets it and dies
+# of the signal, as it would without the trap: it must never answer with the trap's status (it once exited 0, read as a success).
+TASK_SHELL = ('__pk_main=$BASHPID\n'
+              '__pk_stop() { local sig=$1 rc=$2 cmd=$3 p live=; if [ "$BASHPID" != "$__pk_main" ]; then trap - "$sig"; kill -s "$sig" "$BASHPID"; exit 1; fi; case "$cmd" in wait|"wait "*) eval "set -- ${cmd#wait}"; if [ $# -eq 0 ]; then live=1; else for p in "$@"; do kill -0 "$p" 2>/dev/null && live=1; done; fi; if [ -n "$live" ]; then eval "$cmd"; rc=$?; fi;; esac; wait; exit "$rc"; }\n'
+              'trap \'__pk_stop USR1 $? "$BASH_COMMAND"\' USR1\n'
+              'trap \'__pk_stop TERM $? "$BASH_COMMAND"\' TERM\n')
 
 def slot_readings(slot_ids, gpm, smi):
     """One utilisation per expected slot: GPM's where it is a finite number, else nvidia-smi's for that slot, else None (not read).

@@ -43,7 +43,7 @@ We are sharing it early because everyone running agent fleets is learning the sa
 - **Many agents, one git checkout.** [`git/lanegit.sh`](git/lanegit.sh) gives every agent short, scoped commits that never refresh the whole index under the lock, and pushes that never touch the working tree. [`git/ffscoped.py`](git/ffscoped.py) brings outside work into the shared checkout, touching only the changed paths and never overwriting a write made while it runs (the writers of the paths its dry run lists pause meanwhile). Size hooks keep outputs out of git.
 - **An operating model.** [`docs/operating-model.md`](docs/operating-model.md) describes how the original fleet ran: a human gives one word per job, the word is recorded verbatim with its time, and a reviewer agent checks the books.
 - **Light on the login nodes.** Agents live on shared login nodes. [`tools/login_check.py`](tools/login_check.py) looks before anything heavy runs there: load, the least-busy cores, your memory against your per-user limit, other users on the login GPU. It answers GO, REDUCE or WAIT with the command prefix to use; [`docs/login-nodes.md`](docs/login-nodes.md) has the rules the fleet kept.
-- **Tested against a fake Slurm.** [`tests/fleet_guard/run_tests.sh`](tests/fleet_guard/run_tests.sh) runs 97 checks on any laptop, with no scheduler and no GPU, and in CI on every push ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)); its exit status fails the run when any check fails.
+- **Tested against a fake Slurm.** [`tests/fleet_guard/run_tests.sh`](tests/fleet_guard/run_tests.sh) runs 110 checks on any laptop, with no scheduler and no GPU, and in CI on every push ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)); its exit status fails the run when any check fails.
 
 ## How a job flows
 
@@ -79,7 +79,7 @@ Slurm records a job as failed when its batch step exits non-zero, which here mea
 
 ```bash
 git clone <this repository> ganymede && cd ganymede
-bash tests/fleet_guard/run_tests.sh                     # 97 checks against a fake Slurm: RESULT: 97 passed, 0 failed
+bash tests/fleet_guard/run_tests.sh                     # 110 checks against a fake Slurm: RESULT: 110 passed, 0 failed
 python3 tools/login_check.py                             # look before you run anything heavy on a login node
 cp slurm/site.example.env slurm/site.mysite.env          # fill in account, partition, GPUs and cores per node
 cp caps.example.json caps.json                           # one GPU-hour cap per lane tag

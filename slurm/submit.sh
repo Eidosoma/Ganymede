@@ -8,9 +8,10 @@
 #
 # Guards. Each fails closed: if the queue or the accounting cannot be read, nothing is submitted. There is no loop and no retry here.
 #   budget        the job name starts with a lane tag (alpha-...) that has a cap in caps.json; a job whose worst case (time limit x
-#                 GPUs x array tasks x nodes) would take the lane over its cap is refused (exit 3; --over-cap-ok overrides). The check runs
-#                 inside the fleet lock, and each accepted job's worst case is reserved (FLEET_RESERVATIONS_FILE) until the queue or
-#                 accounting shows it, so two submissions can never spend the same headroom
+#                 GPUs x array tasks x nodes) would take the lane over its cap is refused (exit 3; --over-cap-ok overrides), and so is
+#                 every job while caps.json is missing, unreadable or empty or has no finite, non-negative cap for the lane. The check
+#                 runs inside the fleet lock, and each accepted job's worst case is reserved (FLEET_RESERVATIONS_FILE) until the queue
+#                 or accounting shows it, so two submissions can never spend the same headroom
 #   review hold   a worst case above REVIEW_THRESHOLD_HOURS is submitted held for a human's review; the principal releases or cancels it
 #   duplicates    a job whose name is already pending or running on the account is refused (exit 5) unless --allow-same-name
 #   rate          more than MAX_SUBMITS_PER_10MIN submissions from the account inside ten minutes are refused (exit 6)
@@ -79,6 +80,7 @@ LANE="${NAME%%-*}"; NTASKS=1; [ -n "$ARRAY" ] && NTASKS=$(python3 -c "import re,
 for p in s.split(','):
     a,_,b=p.partition('-'); n+= (int(b)-int(a)+1) if b else 1
 print(n)" "$ARRAY")
+[ -n "$LANE" ] || { echo "refused: the job name '$NAME' has no lane tag; it must start with the lane's tag and a hyphen (alpha-what-v1)" >&2; exit 2; }
 if [ $CPU_ONLY = 1 ] && [ $FORCE_NODE = 0 ]; then EST=0; else EST=$(python3 -c "import sys;h,m,s=(sys.argv[1].split(':')+['0','0'])[:3];print(round((int(h)+int(m)/60+int(s)/3600)*int(sys.argv[2])*int(sys.argv[3])*int(sys.argv[4]),3))" "$TIME" "$GPUS_PER_NODE" "$NTASKS" "$NODES"); fi
 if [ "${REVIEW_THRESHOLD_HOURS:-0}" != 0 ] && [ $HOLD = 0 ] && python3 -c "import sys;sys.exit(0 if float(sys.argv[1])>float(sys.argv[2]) else 1)" "$EST" "$REVIEW_THRESHOLD_HOURS"; then
   HOLD=1; ARGS+=(--hold); echo "HELD FOR REVIEW: worst case ${EST} GPU-h exceeds the review threshold ${REVIEW_THRESHOLD_HOURS}; a reviewer checks the job against the lane's plan and reports; the principal releases it (scontrol release ID) or cancels it" >&2
@@ -159,9 +161,10 @@ echo "sbatch ${ARGS[*]} slurm/node.sbatch" >&2
 JOBID=$(sbatch --parsable "${ARGS[@]}" "$JDIR/slurm/node.sbatch")
 echo "$JOBID"
 # reserve the job's worst case, still inside the lock, until the queue or accounting shows the job (budget.py drops it then)
-# the reservation also carries the nodes this job uses at once and whether it was submitted held or chained (it then cannot start by itself)
+# the reservation also carries the nodes this job uses at once, whether it was submitted held or chained (it then cannot start by
+# itself), its task count, and an empty field for when the queue last showed it (the budget check fills it in)
 HELDNOW=0; { [ $HOLD = 1 ] || [ $GUARD_QUEUED = 1 ] || [ -n "$DEPS" ]; } && HELDNOW=1
-if [ "$EST" != 0 ]; then echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$LANE|$EST|$TIME|$NAME|$WANT|$HELDNOW" >> "$RFILE"; fi
+if [ "$EST" != 0 ]; then echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$LANE|$EST|$TIME|$NAME|$WANT|$HELDNOW|$NTASKS|" >> "$RFILE"; fi
 if [ $GUARD_QUEUED = 1 ]; then
   echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$WANT" >> "$QFILE"
   echo "QUEUED BY THE FLEET GUARD: job ${JOBID%%;*} is accepted and held, position $((WAITING+1)) in the fleet queue. It is released automatically, first in first out, when a node frees ($MAX_NODES_IN_FLIGHT at once). Do NOT resubmit it. Queue: $QFILE; the principal can also start it by hand with: scontrol release ${JOBID%%;*}" >&2

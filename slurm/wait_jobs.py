@@ -30,10 +30,13 @@ def wanted(base, task, want):
     """Is a queue or accounting row (base id, task field) part of a requested job, array or element?"""
     return any(base==b and (not t or not task or covers(task,t)) for b,t in want)
 def states(bases):
-    """Accounting rows of these base ids, one per job or array element: {JobID: row}."""
-    out=subprocess.run(['sacct','-X','-n','-P','-j',','.join(bases),'--format=JobID,JobName,State,ElapsedRaw,JobIDRaw,NNodes'],capture_output=True,text=True).stdout
+    """Accounting rows of these base ids, one per job or array element: {JobID: row}; None when the read failed. A failed read is
+    never a picture of the jobs, however much it printed."""
+    try: r=subprocess.run(['sacct','-X','-n','-P','-j',','.join(bases),'--format=JobID,JobName,State,ElapsedRaw,JobIDRaw,NNodes'],capture_output=True,text=True,timeout=300)
+    except Exception: return None
+    if r.returncode!=0: return None
     d={}
-    for l in out.strip().splitlines():
+    for l in r.stdout.strip().splitlines():
         f=l.split('|')
         if len(f)>=4:
             base,task=split_id(f[0])
@@ -77,10 +80,10 @@ def main():
     while True:
         q=queued(bases, want)
         if q is not None and not q:
-            st=states(bases)   # the queue is empty: believe it only when accounting agrees that every job has ended
-            if all(rows(st,b,t) and all(v['state'].startswith(TERMINAL) for v in rows(st,b,t)) for b,t in want): break
+            st=states(bases)   # the queue is empty: believe it only when accounting agrees, in a read that succeeded, that every job has ended
+            if st is not None and all(rows(st,b,t) and all(v['state'].startswith(TERMINAL) for v in rows(st,b,t)) for b,t in want): break
         time.sleep(a.poll)
-    st=states(bases); ok=True; shown=set()
+    ok=True; shown=set()   # the report comes from that same read: a later one that failed, or came back partial, cannot drop a job from it
     for b,t in want:
         for v in sorted(rows(st,b,t), key=lambda v:(len(v['task']), v['task'])):
             if v['id'] in shown: continue
