@@ -16,4 +16,4 @@ The tools limit what an agent can spend and how fast it can submit, but they do 
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities privately to the maintainers at **[security contact to be added before publication]** rather than in a public issue. We will acknowledge the report, work on a fix, and credit you if you wish.
+Please report vulnerabilities privately to the maintainers at [robert@eidosoma.ai](mailto:robert@eidosoma.ai) rather than in a public issue. We will acknowledge the report, work on a fix, and credit you if you wish.

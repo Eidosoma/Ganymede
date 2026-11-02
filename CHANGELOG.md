@@ -8,6 +8,7 @@ Included: the node launcher (`pack_node.py`), the submit wrapper and its guards,
 
 Changed for the public release:
 
+- Security: set robert@eidosoma.ai as the private vulnerability reporting contact.
 - Clarify the company's research and development work, team collaboration and designated responsibility for job approvals; attribute copyright to Robert Bjarnason & Eidosoma.ai.
 - Documentation: clarify how a year of running agent fleets shaped the first version, with further lessons from the JUPITER deployment; distinguish potential risks from observed incidents.
 - Images: a README logo featuring Ganymede serving Jupiter a green drink beside a supercomputer and symbolic job queue, plus a PNG under 510 KB for social sharing.
