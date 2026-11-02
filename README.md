@@ -14,18 +14,18 @@ Ganymede grew out of a year of running agent fleets. That experience helped us a
 
 In September 2026 we gave a dozen AI research agents one GPU allocation on JUPITER and one human to answer to. Each agent ran its own line of research as a long-running session on the machine's login nodes: it designed experiments, wrote the code, asked for the jobs, read the results and wrote them up. Fleets of agents like this are new. Nobody has a settled playbook for running them yet, us included, and we learned as we went. The first weeks on JUPITER put those safeguards to the test. Further issues and near misses led us to strengthen existing guards and add new ones ([lessons learned](docs/lessons-learned.md)).
 
-What goes wrong when many agents share one allocation:
+What can go wrong when many agents share one allocation:
 
-- Agents retry. A failed submit becomes a loop, and a loop becomes a flood of jobs.
-- GPUs sit idle behind a stalled runner while the allocation drains.
-- A shared budget gets spent faster than anyone notices.
-- Agents step on each other's work in a shared repository.
-- Nobody can tell afterwards who ran what, on whose authority, or whether the hours bought anything.
+- Agents retry. A failed submit can become a loop, and a loop can become a flood of jobs.
+- GPUs can sit idle behind a stalled runner while the allocation drains.
+- A shared budget can be spent faster than anyone notices.
+- Agents can step on each other's work in a shared repository.
+- Without a clear record, it can be impossible to tell afterwards who ran what, on whose authority, or whether the hours bought anything.
 
-And two that become especially important as the fleet grows:
+And two more risks that become especially important as the fleet grows:
 
-- **The login nodes are shared.** A dozen agent sessions running tests, builds and probes add up, beside every other user of the machine. A node that falls over takes everyone's work with it, other projects' included.
-- **The scheduler is shared too.** Every budget check and every status check is a query to the accounting database the whole machine uses. A check that rereads everything on every call gets heavier as the fleet grows, until the database starts cutting off its answers.
+- **The login nodes are shared.** A dozen agent sessions running tests, builds and probes add up, beside every other user of the machine. A node that falls over can take everyone's work with it, other projects' included.
+- **The scheduler is shared too.** Every budget check and every status check is a query to the accounting database the whole machine uses. A check that rereads everything on every call can get heavier as the fleet grows, to the point that the database cuts off its answers.
 
 Ganymede is the small set of tools and rules that let such a fleet run for weeks without a human watching every job, while a human still approves every one, and while the fleet stays a good neighbour on a machine it shares with everyone else.
 
