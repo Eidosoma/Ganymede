@@ -1,6 +1,6 @@
 # Lessons learned
 
-Every guard in Ganymede exists because something went wrong, or nearly did, in six and a half weeks of running a dozen agents on one allocation. This page lists the incidents and the rule each one produced. The numbers are from the original deployment on JUPITER Booster.
+Ganymede's first version drew on a year of running agent fleets, with safeguards designed around many of the risks we already anticipated. Six and a half weeks of running a dozen agents on one JUPITER allocation then brought further lessons: incidents and near misses that led us to refine existing safeguards and add new ones. This page lists those incidents and the rules they introduced, strengthened or clarified. The numbers are from the original deployment on JUPITER Booster.
 
 ## Jobs and the scheduler
 

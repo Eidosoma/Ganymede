@@ -1,0 +1,39 @@
+Tool: built-in image_gen
+Mode: three independent generations
+
+1. The cosmic cupbearer
+Asset: ganymede-logo-01-cosmic-cupbearer.png
+
+Use case: logo-brand
+Asset type: 16:9 PNG logo banner for a GitHub README.
+Primary request: Create the "cosmic cupbearer" logo concept for GANYMEDE. Depict Ganymede, Jupiter's cupbearer, as an adult wearing a simple classical tunic and offering a goblet of bright green, bubbly Slurm-like soda with a straw. Jupiter's eagle rests beside him on a compact supercomputer. Small square bubbles form an orderly job queue.
+Style/medium: confident editorial illustration, restrained colours, strong shapes and a touch of wit. Mythological, lightly playful, and technical. Human proportions and an elegant mythological silhouette. Balance character and sophistication; avoid a cute toy mascot or severe cyberpunk aesthetic.
+Composition/framing: landscape, exact 16:9 aspect ratio, ideally 1600 x 900 pixels. A balanced compact illustration and a bold, highly readable wordmark. Comfortable margins, simple background, good readability at README display size. The green soda, Jupiter's eagle, and supercomputer should each be recognizable.
+Text (verbatim): "GANYMEDE", spelled G A N Y M E D E. Only this text, large and clearly readable.
+Constraints: one finished logo image, no mockup or presentation sheet, no additional text, no watermark.
+
+--------------------
+
+2. The eagle and the drink
+Asset: ganymede-logo-02-eagle-and-drink.png
+
+Use case: logo-brand
+Asset type: 16:9 PNG logo banner for a GitHub README.
+Primary request: Create the "eagle and the drink" logo concept for GANYMEDE. Centre the logo on Jupiter's eagle carrying a chalice of glowing green Slurm-like soda. Combine classical mythology with clean technical geometry: the chalice's stem resembles a stack of supercomputer compute nodes with simple server slots and status lights, and queued square bubbles rise from the drink. Include a simple straw so the drink unmistakably reads as a playful green soda.
+Style/medium: a strong original illustrated emblem, crisp outlines, clear silhouette, subtle humour, generous negative space. Sophisticated without looking severe. The eagle is a classical mythological symbol, neither a cartoon mascot nor a realistic photograph. The combination of eagle, goblet, computing and soda should feel like one coherent mark.
+Composition/framing: landscape, exact 16:9 aspect ratio, ideally 1600 x 900 pixels. Centered emblem and prominent GANYMEDE wordmark, comfortable safe margins and a clean background. Readable at GitHub README size.
+Text (verbatim): "GANYMEDE", spelled G A N Y M E D E. Only this text, in bold legible lettering.
+Constraints: one finished logo image, no mockup or presentation sheet, no additional text, no watermark.
+
+--------------------
+
+3. Refreshments on Olympus
+Asset: ganymede-logo-03-refreshments-on-olympus.png
+
+Use case: logo-brand
+Asset type: 16:9 PNG illustrated logo banner for a GitHub README.
+Primary request: Create the "refreshments on Olympus" logo concept for GANYMEDE in a retro science-fiction illustration style. Ganymede, the adult mythological cupbearer in a simple classical tunic, serves a goblet of bright green, bubbly Slurm-like soda with a straw to Jupiter, a relaxed bearded god with a small thunderbolt. Their Olympian counter is a stylised supercomputer, with clear compute-rack modules and a short queue of glowing job tokens along its front.
+Style/medium: mythological, gently humorous, and technically suggestive. Refined retro science-fiction editorial illustration with bold shapes and restrained detail. Charming and confident without becoming a cute cartoon or a severe photorealistic cyberpunk scene. The visual joke is classical gods enjoying a green soda at a supercomputer counter.
+Composition/framing: landscape, exact 16:9 aspect ratio, ideally 1600 x 900 pixels. Keep the scene compact, iconic and uncluttered. Large highly legible GANYMEDE lettering beneath it, a simple background, and comfortable safe margins.
+Text (verbatim): "GANYMEDE", spelled G A N Y M E D E. Only this text.
+Constraints: one finished logo image, no mockup or presentation sheet, no additional text, no watermark.

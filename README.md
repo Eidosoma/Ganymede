@@ -1,3 +1,5 @@
+![Ganymede serving Jupiter a green Slurm-inspired drink beside a supercomputer and symbolic job queue](docs/assets/ganymede-logo-03-refreshments-on-olympus.png)
+
 # Ganymede
 
 **Guardrails for fleets of AI agents sharing one Slurm allocation.**
@@ -8,7 +10,9 @@ Ganymede was built for a fleet of AI research agents on **JUPITER**, Europe's fi
 
 ## Why
 
-In September 2026 we gave a dozen AI research agents one GPU allocation on JUPITER and one human to answer to. Each agent ran its own line of research as a long-running session on the machine's login nodes: it designed experiments, wrote the code, asked for the jobs, read the results and wrote them up. Fleets of agents like this are new. Nobody has a settled playbook for running them yet, us included, and we learned as we went. Ganymede is what we learned in the first weeks, written down as tools and rules. Most of its guards exist because something went wrong, or nearly did ([lessons learned](docs/lessons-learned.md)).
+Ganymede grew out of a year of running agent fleets. That experience helped us anticipate many of the risks of sharing budgets, compute and a working tree, and we built the first version to address them from the outset.
+
+In September 2026 we gave a dozen AI research agents one GPU allocation on JUPITER and one human to answer to. Each agent ran its own line of research as a long-running session on the machine's login nodes: it designed experiments, wrote the code, asked for the jobs, read the results and wrote them up. Fleets of agents like this are new. Nobody has a settled playbook for running them yet, us included, and we learned as we went. The first weeks on JUPITER put those safeguards to the test. Further issues and near misses led us to strengthen existing guards and add new ones ([lessons learned](docs/lessons-learned.md)).
 
 What goes wrong when many agents share one allocation:
 
@@ -18,7 +22,7 @@ What goes wrong when many agents share one allocation:
 - Agents step on each other's work in a shared repository.
 - Nobody can tell afterwards who ran what, on whose authority, or whether the hours bought anything.
 
-And two that only show once the fleet is running:
+And two that become especially important as the fleet grows:
 
 - **The login nodes are shared.** A dozen agent sessions running tests, builds and probes add up, beside every other user of the machine. A node that falls over takes everyone's work with it, other projects' included.
 - **The scheduler is shared too.** Every budget check and every status check is a query to the accounting database the whole machine uses. A check that rereads everything on every call gets heavier as the fleet grows, until the database starts cutting off its answers.
@@ -69,7 +73,7 @@ The first deployment, on JUPITER Booster (four NVIDIA GH200 per node), from 18 S
 | agent lanes sharing the account | 12, plus a calibration lane |
 | tooling releases | 15 in six and a half weeks |
 
-Slurm records a job as failed when its batch step exits non-zero, which here means a task did not exit 0 or the launcher refused the spec; the agents' own experiment failures are counted there, and the receipt says which task failed and how. The incidents that shaped the tools are in [`docs/lessons-learned.md`](docs/lessons-learned.md).
+Slurm records a job as failed when its batch step exits non-zero, which here means a task did not exit 0 or the launcher refused the spec; the agents' own experiment failures are counted there, and the receipt says which task failed and how. The incidents that further shaped the tools are in [`docs/lessons-learned.md`](docs/lessons-learned.md).
 
 ## Quick start
 
@@ -106,7 +110,7 @@ The full walk-through is [`docs/quickstart.md`](docs/quickstart.md).
 | [Multi-node jobs](docs/multi-node.md) | the qualified NCCL recipe |
 | [Configuration](docs/configuration.md) | every site-file key, environment variable and file |
 | [Testing](docs/testing.md) | the fake-Slurm suite and how to extend it |
-| [Lessons learned](docs/lessons-learned.md) | the incidents behind each guard |
+| [Lessons learned](docs/lessons-learned.md) | production lessons that refined and extended the tools |
 | [FAQ](docs/faq.md) | |
 | [Roadmap](ROADMAP.md) | what comes next |
 

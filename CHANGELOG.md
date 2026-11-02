@@ -8,6 +8,8 @@ Included: the node launcher (`pack_node.py`), the submit wrapper and its guards,
 
 Changed for the public release:
 
+- Documentation: clarify how a year of running agent fleets shaped the first version, with further lessons from the JUPITER deployment.
+- Images: a README logo featuring Ganymede serving Jupiter a green drink beside a supercomputer and symbolic job queue, plus a PNG under 510 KB for social sharing.
 - Site files: a generic template (`site.example.env`), JUPITER Booster's settings without an account, and a workstation stand-in. Whole-node charging is a site key (`CHARGE_WHOLE_NODES`) instead of following the site's name.
 - The batch script's directory variable is `FLEET_DIR`.
 - `lanegit.sh`: the checkout defaults to the one you are in (`LANEGIT_ROOT` overrides); a token file is optional (`FLEET_GIT_TOKEN_FILE`), otherwise your own git credentials apply; lane folders for `check` are configurable (`LANEGIT_LANES_PREFIX`); the new-file size limit is configurable (`FLEET_MAX_NEW_FILE_KB`).

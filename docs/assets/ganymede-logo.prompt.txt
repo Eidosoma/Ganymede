@@ -1,0 +1,14 @@
+Tool: built-in image_gen
+Mode: edit of the earlier playful logo concept
+Final asset: ganymede-logo.png
+
+Use case: style-transfer
+Asset type: finished 16:9 logo banner for the top of the Ganymede GitHub README.
+Input images: Image 1 is the previous logo to redesign.
+Primary request: Redesign this logo to be much cooler and science-fiction inspired, with a clear supercomputer reference and a symbolic Slurm job queue. Keep the project name and 16:9 format, but replace the playful cartoon mascot treatment entirely.
+Subject: a striking, coherent technical emblem built around a small bank of four unmistakable supercomputer racks, with crisply segmented compute modules, precise vents and restrained illuminated status lights. A single orderly stream of discrete luminous rectangular job tiles approaches a narrow scheduling gate, then fans into the rack modules: a symbolic FIFO Slurm queue feeding a shared compute allocation. Make this queue a visibly intentional part of the main emblem, readable as waiting jobs moving into compute. Work a subtle angular cup or protective cradle shape into the base of the rack emblem, recalling the project's cupbearer and guardrail meaning. Use a minimal Jupiter arc or planetary limb behind the emblem to connect the name to JUPITER.
+Style/medium: sophisticated sci-fi identity design, precise industrial geometry, strong silhouette, dark metal and crisp cool luminous accents, controlled depth and excellent negative space. Sleek, cinematic, confident, restrained. More like a serious futuristic supercomputing mission insignia than a cartoon.
+Scene/backdrop: very dark clean background with restrained atmospheric light behind the emblem. Keep it quiet so the symbol and name dominate.
+Composition/framing: exact 16:9 landscape canvas, target 1600 x 900 pixels. One centered emblem above one prominent wordmark, comfortable safe margins. Queue, racks and planetary arc must read as a unified logo, with enough simplified detail to remain readable in a README.
+Text (verbatim): "GANYMEDE", spelled G A N Y M E D E, in sharp, beautifully spaced futuristic uppercase lettering. No other text or labels.
+Constraints: retain the exact project name and wide composition. Replace the smiling robot, face, laurel, toga, trophy-like goblet, bright cartoon palette, and rounded bubble typography. No characters, no cartoon eyes, no floating interface text, no slogan, no watermark, no collage, no generic busy cyberpunk city. Make the supercomputer and symbolic job queue the unmistakable main concept.
