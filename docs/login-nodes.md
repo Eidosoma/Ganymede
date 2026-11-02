@@ -56,7 +56,7 @@ nvidia-smi                                            # the login GPU: memory us
 
 **The login GPU**
 
-- **It is shared, and people arrive mid-run.** Check `nvidia-smi` before you start. While anyone else uses the card, keep each of your items at or under 16 GiB for the whole run. A launch-time check is not enough: on one evening four runs ended up over the limit while others used the card, and three of them had started on a free card.
+- **It is shared, and people arrive mid-run.** Check `nvidia-smi` before you start. While anyone else uses the card, keep what your account holds on it at or under 16 GiB in all, for the whole run; the load check adds what you hold already to the new run. A launch-time check is not enough: on one evening four runs ended up over the limit while others used the card, and three of them had started on a free card.
 - **Watch it while you run, and stop everything you started.** A watchdog that ends your item when the card fills must end every process of the item, including workers started in their own sessions (MPS clients), and any daemon you started.
 - **Probes and qualification only.** Science runs on the fleet. Record each login-GPU item's start and end, the card's other load, and its utilisation, and count login GPU-hours apart from the allocation.
 

@@ -6,7 +6,9 @@ receipts, the five things a lane's multi-node job depends on: (1) rendezvous fro
 (SLURM_NNODES, SLURM_NODEID, SLURM_JOB_NODELIST) and one visible GPU per task; (2) NCCL collectives across nodes (all-reduce value
 check, all-gather of host / slot / GPU identity); (3) inter-node bandwidth (256 MiB float32 all-reduce, bus bandwidth); (4) a real
 DistributedDataParallel training loop with parameters identical on every rank at the end; (5) the launcher's forwarded SIGUSR1:
-checkpoint on rank 0, barrier, exit 0 on every rank, so the receipts read as a checkpoint segment on every node.
+checkpoint on rank 0, barrier, exit 0 on every rank, so the receipts read as a checkpoint segment on every node. Leaving the training
+loop is decided together (the signal on any rank, or any rank's deadline), so every rank stops at the same step; the parameters are
+compared tensor by tensor, bit for bit. probes/test_nccl_stop.py checks both on CPU.
 Scientific weight zero. Writes nccl-rank<R>.json (every rank) and nccl-summary.json (rank 0) into PACK_RECEIPT_DIR."""
 import argparse, datetime, json, os, signal, socket, subprocess, sys, time
 
@@ -30,6 +32,32 @@ def resolve_master(first):
         if not str(tried[cand]).startswith('unresolved'):
             return cand, tried
     return first, tried
+
+def train_until_stop(step, stop, deadline, dist, flag, every=20):
+    """Run step() until some rank has seen the stop signal or passed its own deadline. The ranks decide together: every `every` steps
+    they all-reduce [signal seen, deadline passed] with MAX, so all of them leave at the same step and their collectives stay matched.
+    (Each rank used to leave on its own clock: one past its deadline left the loop while another was still in DDP's all-reduce.)
+    Returns (steps, (stopped by the signal, stopped by a deadline))."""
+    steps = 0
+    while True:
+        step(); steps += 1
+        if steps % every == 0:
+            flag[0] = 1.0 if stop['flag'] else 0.0
+            flag[1] = 1.0 if time.time() >= deadline else 0.0
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            if float(flag.max()) > 0:
+                return steps, (bool(flag[0] > 0), bool(flag[1] > 0))
+
+def tensors_differing(params, dist):
+    """How many parameter tensors differ from rank 0's, bit for bit, counted on every rank and summed: 0 means identical. A checksum
+    of sums can agree while tensors differ (two values swapped, or errors that cancel)."""
+    import torch
+    n = torch.zeros(1, device=params[0].device)
+    for p in params:
+        ref = p.detach().clone(); dist.broadcast(ref, src=0)
+        if not torch.equal(ref, p.detach()): n += 1
+    dist.all_reduce(n)
+    return int(n.item())
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--local-rank', type=int, required=True)
@@ -99,20 +127,19 @@ def main():
         def forward(s, h): return h + s.b(torch.nn.functional.gelu(s.a(h)))
     model = torch.nn.Sequential(*[Block() for _ in range(depth)]).to(dev); ddp = DDP(model, device_ids=[0])
     opt = torch.optim.AdamW(ddp.parameters(), lr=1e-4); g = torch.Generator(device=dev); g.manual_seed(100 + rank)
-    steps, tstart, deadline, batch = 0, time.time(), time.time() + a.minutes * 60, 256
-    flag = torch.zeros(1, device=dev)
-    while time.time() < deadline:
+    batch, tstart, deadline, last = 256, time.time(), time.time() + a.minutes * 60, {}
+    def step():
         h = torch.randn(batch, width, device=dev, generator=g); loss = ddp(h).pow(2).mean()
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); steps += 1
-        if steps % 20 == 0:   # agree on stopping: any rank that saw SIGUSR1 stops everyone at the same step
-            flag.fill_(1.0 if stop['flag'] else 0.0); dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-            if flag.item() > 0: break
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); last['loss'] = loss
+    steps, (by_signal, by_deadline) = train_until_stop(step, stop, deadline, dist, torch.zeros(2, device=dev))
     torch.cuda.synchronize(); el = time.time() - tstart
     rec['ddp'] = dict(steps=steps, seconds=round(el, 2), samples_per_s_per_rank=round(steps * batch / el, 1), parameters=sum(p.numel() for p in model.parameters()),
-                      stopped_by_signal=bool(flag.item() > 0), final_loss=float(loss.item()))
+                      stopped_by_signal=by_signal, stopped_by_deadline=by_deadline, final_loss=float(last['loss'].item()))
     chk = torch.stack([p.detach().double().sum() for p in model.parameters()]).sum().reshape(1)
     lo, hi = chk.clone(), chk.clone(); dist.all_reduce(lo, op=dist.ReduceOp.MIN); dist.all_reduce(hi, op=dist.ReduceOp.MAX)
-    rec['parameters_identical_across_ranks'] = bool((hi - lo).abs().item() == 0.0)
+    rec['parameter_checksum_spread'] = float((hi - lo).abs().item())   # for the record only: a checksum can agree while tensors differ
+    rec['parameter_tensors_differing'] = tensors_differing(list(model.parameters()), dist)
+    rec['parameters_identical_across_ranks'] = rec['parameter_tensors_differing'] == 0
     assert rec['parameters_identical_across_ranks'], 'DDP parameters differ across ranks'
     # (5) checkpoint on rank 0 (whether stopped by the signal or by the clock), barrier, exit 0 everywhere
     if rank == 0:

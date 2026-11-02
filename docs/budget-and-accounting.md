@@ -62,7 +62,7 @@ bash slurm/jobs.sh alpha --since 2026-10-01             # one lane's jobs in the
 python3 slurm/wait_jobs.py 1234567 1234568 --poll 1200  # block until these jobs have ended, then summarise their receipts
 ```
 
-`wait_jobs.py` returns only when the queue no longer lists the jobs *and* accounting shows a terminal state for each. A failed `squeue` never counts as an empty queue, because a waiter that returns early lets an agent start the next segment beside the first. It checks every 10 minutes by default (`--poll`) and never faster than once a minute: one watcher per job, polling slowly, is the fleet's rule for a scheduler everyone shares. Exit 0 means every job completed with `all_ok`; anything else is 1.
+`wait_jobs.py` returns only when the queue no longer lists the jobs *and* accounting shows a terminal state for each. A failed `squeue` never counts as an empty queue, because a waiter that returns early lets an agent start the next segment beside the first. It checks every 10 minutes by default (`--poll`) and never faster than once a minute: one watcher per job, polling slowly, is the fleet's rule for a scheduler everyone shares. Exit 0 means every job completed with `all_ok`; anything else is 1. An ID may be a whole array, followed element by element as accounting lists it (`1234567_0`, `1234567_1`, ...), or one element; each element's receipt is under its own job id, and a job on several nodes needs every node's receipt (`node-0`, `node-1`, ...).
 
 ## Getting results home
 

@@ -16,6 +16,10 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **A missing file meant no limit.** Found in the same review, and reproduced: the budget check read a missing caps file as an empty list of caps and refused an unknown lane only when the list was not empty, so a first installation, or a copy of the tooling without its caps, let every lane run uncapped (a job named `mystery-uncapped` went in); a cap of NaN could never be exceeded. *Rules:* a guard's configuration is part of the guard. No valid caps file, no submission; a cap is a finite, non-negative number; the deliberate override stays explicit (`--over-cap-ok`).
 
+**The shell died of the checkpoint signal.** Found in the same review, and reproduced: a task written as two commands left its shell as the program's parent; the forwarded signal killed the shell at once, the launcher took that as the task's end, and the job could finish while the program was still saving. *Rule:* the task shell traps the signal, waits for the running command, exits with its status and starts nothing more.
+
+**A failing suite looked green.** Found in the same review, and reproduced: the test runner printed its failures and exited 0, so a script or CI that reads only the exit status saw success. *Rule:* a suite ends on its failure count; the exit status is part of the result.
+
 **Silence read as zero.** A failed `squeue` looked like an empty queue, so a waiter returned while the job was still running, and a budget check could read "nothing used". *Rule:* every tool fails closed. A wrapper that cannot read the queue submits nothing; a budget check that cannot read accounting refuses; a waiter believes an empty queue only when accounting shows the job has ended.
 
 **A full fleet made agents retry.** The first ceiling refused jobs when the fleet was full, and the agent had to come back later. Agents that come back later are agents that loop. *Rule:* accept and hold. The job is queued and released first in first out by a dispatcher that runs at every job's end and every submission.
@@ -33,6 +37,8 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 ## GPUs and nodes
 
 **GPUs sat idle behind stalled runners.** One job held a node for about five hours after its runner stalled, and about 19 of its 24 GPU-hours were idle. Another lost about 20 of 37 to a trainer that hung at exit. *Rule:* the GPU-idle watchdog. When every GPU is under 1 % for 45 minutes, the job ends and is recorded as a failure to read. Every job gets it, and a spec cannot opt out.
+
+**Missing is not idle.** Found in the same review, and reproduced: the watchdog judged a job on the cards it could read, so one card idle and one never read ended the job as if both were idle. *Rule:* a reading for every card, from a second source when the first misses one; a sample with any card unread counts as active.
 
 **GPU slot 0 was slower.** In job after job, the task on GPU 0 ran 15 to 30 % slower, because its feeder held core 0, where the operating system, interrupts, the Slurm step and the launcher's own samplers live. *Rules:* reserve the lowest cores, give feeders the highest cores of their processor, and give each feeder cores local to its GPU.
 
@@ -71,6 +77,8 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 **A merge was raced.** `git merge --ff-only` spent 15 minutes checking 321,543 tracked files before merging; an agent committed meanwhile, and git refused its final ref update after the files and index were written. *Rule:* bring outside work in with `ffscoped.py`, which reads only the changed paths and moves main with a guarded ref update (93 paths in 1.5 seconds).
 
 **The merge tool could overwrite a write.** Found in the same review, and reproduced: the scoped fast-forward checked each file, then wrote over it later; an agent's edit in between was overwritten, the tool reported success, and git showed a clean checkout, so the edit, never committed, was simply gone. *Rules:* move the old file aside and check it again before anything replaces it; put the new version in with an operation that fails rather than replace (a hard link); stop and keep, never resolve, when a writer shows up; and pause the writers of the paths being updated, because only that covers a file held open across the update.
+
+**A replayed index update staged a newer edit.** Found in the same review, and reproduced: a deferred update of the shared index, replayed later, hashed the working file, so an edit made after the commit was staged, and the next folder commit, which looked only at unstaged changes, said nothing had changed. *Rules:* the shared index takes the committed versions; a folder commit looks at what is staged too.
 
 **Loose objects slowed every commit.** Many small commits left 24,000 loose objects. *Rule:* repack incrementally when they pass 20,000 (`git repack -d -l`: 3 minutes 24 seconds, no lock); a full `git gc` took two hours.
 

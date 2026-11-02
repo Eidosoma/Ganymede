@@ -1,10 +1,13 @@
 #!/bin/bash
 # tests/fleet_guard/run_tests.sh [TOOLING_DIR]: the submit wrapper's guards, the fleet queue and its dispatcher, the budget check and
 # wait_jobs.py, run against a FAKE Slurm (bin/: squeue, sbatch, scontrol, sacct over a state file), then the launcher's GPU-idle
-# watchdog (test_watchdog.sh) and the scoped fast-forward (test_ffscoped.sh). Nothing here can reach a real scheduler: PATH puts the
+# watchdog (test_watchdog.sh), the scoped fast-forward (test_ffscoped.sh), the launcher's task shell and launch failures
+# (test_launcher.sh), lanegit's index update (test_lanegit.sh) and the login check (test_login_check.sh). Nothing here can reach a
+# real scheduler: PATH puts the
 # fakes first, and the tooling under test is a temporary copy with the test site file (site.test.env: four nodes, review threshold 50)
 # and the test caps (caps.test.json), so no live receipt, log, queue or caps file is touched.
-# Run it before every release: bash tests/fleet_guard/run_tests.sh   (last line: RESULT: N passed, 0 failed)
+# Run it before every release, and in CI: bash tests/fleet_guard/run_tests.sh   (last line: RESULT: N passed, 0 failed; the exit status
+# is 0 only when no check failed)
 HERE="$(cd "$(dirname "$0")" && pwd)"; TOOLING="${1:-$(cd "$HERE/../.." && pwd)}"
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet_guard_test.XXXXXX"); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stage"; cp -r "$TOOLING/slurm" "$T/stage/"; cp "$TOOLING/VERSION" "$T/stage/"; cp -r "$HERE/bin" "$T/bin"; cp "$HERE/spec.json" "$T/spec.json"
@@ -136,6 +139,21 @@ print(m.DEFAULT_POLL, m.MIN_POLL)
 PYEOF
 }
 check "it polls every ten minutes by default and never faster than once a minute" '[ "$(wj_consts "$STAGE/slurm/wait_jobs.py")" = "600.0 60.0" ]'
+
+wj(){ OUTW=$(timeout "${2:-10}" python3 "$STAGE/slurm/wait_jobs.py" $1 --poll 1 --receipts "$T/rcpt" 2>&1); RCW=$?; }
+rcpt(){ mkdir -p "$T/rcpt/$1"; echo "{\"all_ok\": ${2:-true}, \"wall_s\": 5, \"gpu_slot_hours_held\": 0.01, \"tasks\": [], \"interrupted\": null}" > "$T/rcpt/$1/receipt.json"; }
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "700_0|arr-x-v1|COMPLETED|10|701|1" "700_1|arr-x-v1|COMPLETED|10|700|1" > "$FAKE/sacct.txt"; rcpt arr-x-v1-701-a0; rcpt arr-x-v1-700-a1; wj 700
+check "an array that accounting lists as 700_0 and 700_1 (never 700): the wait ends, exit 0, each element's receipt found under its own job id" '[ $RCW = 0 ] && [ $(echo "$OUTW" | grep -c "all_ok=True") = 2 ] && echo "$OUTW" | grep -q "^job 700_1 arr-x-v1 COMPLETED"'
+printf '%s\n' "700_0|arr-x-v1|COMPLETED|10|701|1" "700_1|arr-x-v1|FAILED|10|700|1" > "$FAKE/sacct.txt"; wj 700
+check "one element failed: exit 1" '[ $RCW = 1 ]'
+reset; rm -rf "$T/rcpt"; echo "700_0|700|1|R|(null)|None|2026-09-20T10:00:00|arr-x-v1|1:00:00|0:10" > "$FAKE/jobs.txt"; printf '%s\n' "700_0|arr-x-v1|RUNNING|10|701|1" "700_1|arr-x-v1|COMPLETED|10|700|1" > "$FAKE/sacct.txt"; rcpt arr-x-v1-700-a1; wj 700_1
+check "waiting for one element (700_1) while another still runs: the wait ends for it, exit 0, only that element reported" '[ $RCW = 0 ] && echo "$OUTW" | grep -q "^job 700_1 " && ! echo "$OUTW" | grep -q "^job 700_0 "'
+wj 700 6
+check "waiting for the whole array while an element still runs: it keeps waiting" '[ $RCW = 124 ]'
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; echo "702|two-x-v1|COMPLETED|10|702|2" > "$FAKE/sacct.txt"; rcpt two-x-v1-702/node-0; rcpt two-x-v1-702/node-1; wj 702
+check "a two-node job with both nodes' receipts all ok: exit 0, both receipts named" '[ $RCW = 0 ] && [ $(echo "$OUTW" | grep -o "node-[01]/receipt.json" | sort -u | wc -l) = 2 ]'
+rm -rf "$T/rcpt/two-x-v1-702/node-1"; wj 702
+check "the same job with one node's receipt missing: exit 1, the missing receipt named" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "missing: .*node-1/receipt.json"'
 
 echo "17. the queue file is pruned and the dispatcher stays quiet when nobody waits"
 reset; job 101; job 102; job 103; job 104; sub --name alpha-prune-a; QA=$OUT; sub --name alpha-prune-b; QB=$OUT
@@ -279,7 +297,14 @@ reset; rm -f "$STAGE/caps.json"; J=$(python3 "$STAGE/slurm/budget.py" --site tes
 check "the table without a caps file still works (exit 0, JSON)" '[ $JRC = 0 ] && echo "$J" | python3 -c "import json,sys; json.load(sys.stdin)"'
 cp "$T/caps.saved" "$STAGE/caps.json"
 
-echo "25. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "25. the launcher's task shell under the checkpoint signal, and a task that cannot start: tests/fleet_guard/test_launcher.sh"
+if TMPDIR="$T" bash "$HERE/test_launcher.sh" "$TOOLING/pack_node.py" > "$T/la.out" 2>&1; then ok "launcher suite: $(tail -1 "$T/la.out")"; else bad "launcher suite: $(tail -1 "$T/la.out")"; cat "$T/la.out"; fi
+
+echo "26. lanegit's shared-index update: tests/fleet_guard/test_lanegit.sh"
+if TMPDIR="$T" bash "$HERE/test_lanegit.sh" "$TOOLING/git/lanegit.sh" > "$T/lg.out" 2>&1; then ok "lanegit suite: $(tail -1 "$T/lg.out")"; else bad "lanegit suite: $(tail -1 "$T/lg.out")"; cat "$T/lg.out"; fi
+
+echo "27. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"
+[ "$FAILS" -eq 0 ]   # the exit status: a run with a failed check is a failed run (it used to exit 0 whatever failed)

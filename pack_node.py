@@ -28,17 +28,38 @@ Receipt: <receipt-dir>/receipt.json and receipt.md (per-task wall, exit code, us
 GPU-slot-hours held = slots * wall / 3600, optional nvidia-smi samples). Exit code: 0 if every task exited 0, else 1;
 2 for a refused spec.
 Signals: SIGUSR1 (Slurm's --signal warning before the wall limit) and SIGTERM are forwarded to every task, then the launcher
-waits --grace seconds and terminates what is left; the receipt records the interruption.
+waits --grace seconds and terminates what is left; the receipt records the interruption. The task shell outlives the forwarded
+signal: it waits for the running command, exits with that command's status and starts nothing more, so a compound command
+("python train.py; echo done") checkpoints like a single one; a program killed by signal N reads exit 128+N. A task whose folder
+is missing is refused before anything starts; a task that cannot be started stops the ones already started, and the receipt
+records it (launch_error).
 GPU-idle watchdog (every job; a spec cannot opt out): when every GPU slot has
 read under --idle-gpu-util percent utilisation for --idle-gpu-minutes (default 1 % for 45 minutes, from the job's start), the
 launcher ends the job as if by SIGTERM; the receipt says so (gpu_idle_watchdog: triggered, idle_since, idle_s, last_active_by_slot) and
 the launcher prints a timestamped GPU-IDLE WATCHDOG line to its stdout (the Slurm job log logs/<name>-<jobid>.out); a sample that cannot be read counts
-as active. --idle-gpu-minutes 0 disables it (the site file's choice, never a spec's).
+as active, and so does a sample in which any one slot cannot be read. --idle-gpu-minutes 0 disables it (the site file's choice, never a spec's).
 """
-import argparse, json, os, shlex, signal, socket, subprocess, sys, threading, time
+import argparse, json, math, os, shlex, signal, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+# The task shell outlives the forwarded signal. SIGUSR1 and SIGTERM go to the task's whole process group; a shell that is still a
+# parent (a compound command such as "python train.py; echo done") used to die of the signal at once, so the launcher stopped waiting
+# while the program was still saving. With this trap the shell waits for the running command, then exits with its status and starts
+# nothing more. (A program killed by signal N reads exit 128+N; a single command that the shell used to replace read -N.)
+TASK_SHELL = "trap '__pk_rc=$?; wait; exit $__pk_rc' USR1 TERM\n"
+
+def slot_readings(slot_ids, gpm, smi):
+    """One utilisation per expected slot: GPM's where it is a finite number, else nvidia-smi's for that slot, else None (not read).
+    The idle watchdog counts a sample with any slot not read as active: missing is not idle."""
+    out = {}
+    for s in slot_ids:
+        v = gpm.get(s)
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)):
+            v = smi.get(s)
+        out[s] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    return out
 
 POOL_WORKER = r"""#!/usr/bin/env python3
 # pool worker: runs commands i, i+parallel, i+2*parallel, ... of a command file; one line per command in the log: index rc seconds
@@ -198,7 +219,9 @@ def main():
     args=ap.parse_args()
     spec=json.load(open(args.spec)); gpu_tasks=spec.get('gpu_tasks',[]); cpu_tasks=spec.get('cpu_tasks',[]); pools=spec.get('cpu_pools',[])
     for pl in pools:
-        pl.setdefault('threads',1); pl.setdefault('parallel',1); pl['_cmds']=[l.rstrip('\n') for l in open(os.path.join(pl.get('cwd') or os.getcwd(), pl['cmd_file'])) if l.strip() and not l.startswith('#')]
+        pl.setdefault('threads',1); pl.setdefault('parallel',1)
+        try: pl['_cmds']=[l.rstrip('\n') for l in open(os.path.join(pl.get('cwd') or os.getcwd(), pl['cmd_file'])) if l.strip() and not l.startswith('#')]
+        except OSError as e: print(f"REFUSED: cpu_pool {pl.get('name')}: its command file cannot be read ({e})", file=sys.stderr); sys.exit(2)
     mode=detect_mode(args)
     if mode=='cpu' and gpu_tasks: raise SystemExit('--mode cpu with gpu_tasks in the spec; drop them or run in a GPU allocation')
     if not gpu_tasks and mode!='fake': mode='cpu'   # a CPU-only spec never claims GPU slots, in Slurm or locally
@@ -239,7 +262,7 @@ def main():
             nv = args.nice if kind=='gpu' else max(args.nice, args.sidecar_nice)
             if nv: cmd+=['nice','-n',str(nv)]
             pre = (f"ulimit -v {int(float(t['mem_gb'])*1048576)}; " if t.get('mem_gb') else '')
-            cmd+=['bash','-lc',pre+t['cmd']]
+            cmd+=['bash','-lc',TASK_SHELL+pre+t['cmd']]
             launches.append(dict(kind=kind,name=t['name'],slot=slot,cores=c,cmd=t['cmd'],cwd=t.get('cwd') or os.getcwd(),env=env,argv=cmd))
     for k,pl in enumerate(pools):
         # one worker per parallel slot, each pinned to its own cores, consuming the shared command list by index (stride = parallel)
@@ -258,14 +281,33 @@ def main():
             script=pre+f"exec {sys.executable} '{os.path.join(rd,'pool_worker.py')}' '{cmdf}' {w} {pl['parallel']} '{logf}'"
             cmd=['taskset','-c',','.join(map(str,c)),'nice','-n',str(max(args.nice,args.sidecar_nice)),'bash','-lc',script]
             launches.append(dict(kind='pool',name=f"{pl['name']}-w{w}",slot='',cores=c,cmd=f"pool {pl['name']} worker {w} of {pl['parallel']} over {len(pl['_cmds'])} commands",cwd=pl.get('cwd') or os.getcwd(),env=env,argv=cmd))
+    missing=[f"{l['name']} ({l['cwd']})" for l in launches if not os.path.isdir(l['cwd'])]
+    if missing:   # every task's folder is checked before anything starts (a later task's missing folder used to leave the earlier ones running, with no receipt)
+        print('REFUSED: task folder(s) missing: ' + '; '.join(missing), file=sys.stderr); sys.exit(2)
     if args.dry_run:
         for l in launches: print(f"[{l['kind']}] {l['name']}: slot={l['slot']!r} cores={l['cores']} cwd={l['cwd']} cmd={l['cmd']}")
         print('free cores:',plan['free']); return
-    procs={}
-    for l in launches:
-        out=open(os.path.join(args.receipt_dir,f"{l['name']}.out"),'wb'); err=open(os.path.join(args.receipt_dir,f"{l['name']}.err"),'wb')
-        l['start']=time.time(); l['start_iso']=now()
-        p=subprocess.Popen(l['argv'],cwd=l['cwd'],env=l['env'],stdout=out,stderr=err,start_new_session=True)
+    procs={}; receipt['launch_error']=None
+    for k,l in enumerate(launches):
+        try:
+            if os.environ.get('PACK_TEST_FAIL_LAUNCH')==l['name']: raise OSError('a launch failure made by PACK_TEST_FAIL_LAUNCH (tests only)')
+            out=open(os.path.join(args.receipt_dir,f"{l['name']}.out"),'wb'); err=open(os.path.join(args.receipt_dir,f"{l['name']}.err"),'wb')
+            l['start']=time.time(); l['start_iso']=now()
+            p=subprocess.Popen(l['argv'],cwd=l['cwd'],env=l['env'],stdout=out,stderr=err,start_new_session=True)
+        except Exception as e:
+            # a task that cannot be started ends the job cleanly: the tasks already started are stopped and reaped below, and the receipt
+            # records it (this used to end in a traceback, with the started tasks still running and no receipt)
+            receipt['launch_error']=dict(task=l['name'],error=f"{type(e).__name__}: {e}"[:300],at=now(),not_started=[x['name'] for x in launches[k:]])
+            print(f"{now()} LAUNCH FAILED: task {l['name']}: {receipt['launch_error']['error']}; stopping the {len(procs)} task(s) already started; the receipt records it",file=sys.stderr,flush=True)
+            for pid in procs:
+                try: os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError: pass
+            t_end=time.time()+min(args.grace,10)
+            while time.time()<t_end and any(p2.poll() is None for p2,_ in procs.values()): time.sleep(0.1)
+            for pid in procs:
+                try: os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+            break
         l['pid']=p.pid; procs[p.pid]=(p,l)
     stop=threading.Event()
     def forward(sig, frame):
@@ -277,23 +319,25 @@ def main():
         if sig!=signal.SIGUSR1:
             time.sleep(args.grace)
             for pid,(p,l) in procs.items():
-                if p.poll() is None:
-                    try: os.killpg(pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
+                p.poll()   # reaps a task shell that has ended; whatever it started may still be in its group
+                try: os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError): pass
     signal.signal(signal.SIGUSR1, forward); signal.signal(signal.SIGTERM, forward)
     gpm=GpmSampler() if (args.sample and mode!='fake') else None
     slot_bus={s[0]:(s[1] or '').lower()[-12:] for s in slots}
     receipt['gpu_sampler']=('gpm' if (gpm and gpm.nv) else 'nvidia-smi'); receipt['gpm_samples']=[]
     fake_util=os.environ.get('PACK_FAKE_GPU_UTIL')   # tests only (fake mode): every slot samples this utilisation in percent
-    wd=dict(minutes=args.idle_gpu_minutes, util_percent=args.idle_gpu_util, triggered=None, last_active_by_slot={str(s[0]):'start' for s in slots}); receipt['gpu_idle_watchdog']=wd
+    wd=dict(minutes=args.idle_gpu_minutes, util_percent=args.idle_gpu_util, triggered=None, unread_samples=0, last_active_by_slot={str(s[0]):'start' for s in slots}); receipt['gpu_idle_watchdog']=wd
     slot_ids={str(s[0]) for s in slots}; last_active=[time.time()]; last_active_iso=['start']
     def watchdog(utils, tnow):
-        """utils: {slot: utilisation percent} of one sample, or None when nothing could be read (counts as active, never as idle)."""
+        """utils: {slot: utilisation percent, or None for a slot that could not be read} for every slot of one sample, or None when
+        nothing could be read. A sample with any slot not read counts as active, never as idle: the slots that were read used to stand
+        for all of them, so a job could be ended while one card was never read."""
         t_iso=now()
-        if utils is None:
-            last_active[0]=tnow; last_active_iso[0]=t_iso; return
-        for slot,u in utils.items():
-            if u>=wd['util_percent']: wd['last_active_by_slot'][slot]=t_iso
+        for slot,u in (utils or {}).items():
+            if u is not None and u>=wd['util_percent']: wd['last_active_by_slot'][slot]=t_iso
+        if utils is None or set(utils)!=slot_ids or any(u is None for u in utils.values()):
+            wd['unread_samples']+=1; last_active[0]=tnow; last_active_iso[0]=t_iso; return
         if any(u>=wd['util_percent'] for u in utils.values()): last_active[0]=tnow; last_active_iso[0]=t_iso; return
         if wd['minutes']>0 and wd['triggered'] is None and tnow-last_active[0]>=wd['minutes']*60:
             wd.update(triggered=t_iso, idle_since=last_active_iso[0], idle_s=round(tnow-last_active[0],1), action='SIGTERM to every task: every GPU slot under the threshold for the whole window')
@@ -302,27 +346,32 @@ def main():
     def sampler():
         while not stop.wait(args.sample):
             utils=None; tnow=time.time()
-            if fake_util is not None:
-                u=float(fake_util); receipt['gpu_samples'].append(dict(t=now(),rows=[f"{s[0]}, {int(u)}, 0" for s in slots])); utils={str(s[0]):u for s in slots}
+            if fake_util is not None:   # tests only: one value for every slot, or one per slot, x for a slot that cannot be read
+                vals=[x.strip() for x in fake_util.split(',')]; vals=vals*len(slots) if len(vals)==1 else vals+['x']*len(slots)
+                fv={}
+                for (s,_),x in zip(slots,vals):
+                    try: fv[str(s)]=float(x)
+                    except ValueError: pass
+                utils=slot_readings(slot_ids,fv,{})
+                receipt['gpu_samples'].append(dict(t=now(),rows=[f"{s[0]}, {int(utils[str(s[0])]) if utils[str(s[0])] is not None else '[N/A]'}, 0" for s in slots]))
             else:
+                gv={}; sv={}
                 if gpm and gpm.nv:
                     r=gpm.read(); t=now()
                     if r is not None:
                         g={slot:r.get(bus) for slot,bus in slot_bus.items() if bus in r}; receipt['gpm_samples'].append(dict(t=t,gpus=g))
-                        v={str(slot):float(x.get('graphics_util')) for slot,x in g.items() if isinstance(x,dict) and 'error' not in x and x.get('graphics_util') is not None}
-                        if v: utils=v
+                        gv={str(slot):x.get('graphics_util') for slot,x in g.items() if isinstance(x,dict) and 'error' not in x}
                 try:
                     r=subprocess.run(['nvidia-smi','--query-gpu=index,utilization.gpu,memory.used','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=10)
                     rows=[x.strip() for x in r.stdout.strip().splitlines()]; receipt['gpu_samples'].append(dict(t=now(),rows=rows))
-                    if utils is None:
-                        v={}
-                        for row in rows:
-                            p=[y.strip() for y in row.split(',')]
-                            if len(p)>=2 and p[0] in slot_ids and p[1].isdigit(): v[p[0]]=float(p[1])
-                        if v: utils=v
+                    for row in rows:
+                        p=[y.strip() for y in row.split(',')]
+                        if len(p)>=2 and p[0] in slot_ids and p[1].isdigit(): sv[p[0]]=float(p[1])
                 except Exception as e: receipt['gpu_samples'].append(dict(t=now(),error=str(e)))
+                utils=slot_readings(slot_ids,gv,sv)   # every slot: GPM's reading, else nvidia-smi's for that slot, else None (not read)
+                if all(u is None for u in utils.values()): utils=None
             watchdog(utils, tnow)
-    if args.sample and (mode!='fake' or fake_util is not None): threading.Thread(target=sampler,daemon=True).start()
+    if args.sample and (mode!='fake' or fake_util is not None) and not receipt['launch_error']: threading.Thread(target=sampler,daemon=True).start()
     gpu_cores=sorted({c for l in launches if l['kind']=='gpu' for c in l['cores']}); side_cores=sorted({c for l in launches if l['kind']!='gpu' for c in l['cores']})
     receipt['cpu_samples']=[]; receipt['gpu_cores']=gpu_cores; receipt['sidecar_cores']=side_cores
     def readstat():
@@ -340,7 +389,7 @@ def main():
                 return round(1-idl/tot,3) if tot else None
             receipt['cpu_samples'].append(dict(t=now(),gpu_cores_busy=busy(gpu_cores),sidecar_cores_busy=busy(side_cores),other_cores_busy=busy([c for c in cur if c not in gpu_cores and c not in side_cores])))
             prev=cur
-    if args.cpu_sample: threading.Thread(target=cpu_sampler,daemon=True).start()
+    if args.cpu_sample and not receipt['launch_error']: threading.Thread(target=cpu_sampler,daemon=True).start()
     t0=time.time(); pending=dict(procs)
     while pending:
         try: pid,status,ru=os.wait4(-1,0)
@@ -376,7 +425,7 @@ def main():
     exits_ok=all(t['exit']==0 for t in receipt['tasks']) and all(p['failed']==0 and p['completed']==p['commands'] for p in receipt['pools'])
     usr1=receipt['interrupted'] is not None and receipt['interrupted'].get('signal')==int(signal.SIGUSR1)
     receipt.update(ended=now(),wall_s=round(wall,3),gpu_slot_hours_held=round(len(slots)*wall/3600,6),cpu_seconds=round(sum(t['utime_s']+t['stime_s'] for t in receipt['tasks']),3),
-                   checkpoint_segment=bool(usr1 and exits_ok), all_ok=exits_ok and (receipt['interrupted'] is None or usr1))
+                   checkpoint_segment=bool(usr1 and exits_ok and not receipt['launch_error']), all_ok=exits_ok and (receipt['interrupted'] is None or usr1) and not receipt['launch_error'])
     # per-GPU activity summary: interval-averaged GPM where available (the truthful one), else nvidia-smi's instantaneous samples
     gsum={}
     for slot in [s[0] for s in slots]:
@@ -412,6 +461,7 @@ def main():
             f.write(f"\ncpu busy (mean over samples): gpu cores {round(sum(g)/len(g),3) if g else 'n/a'}, sidecar cores {round(sum(sd)/len(sd),3) if sd else 'n/a'}, {len(receipt['cpu_samples'])} samples\n")
         if receipt.get('gpu_idle_watchdog',{}).get('triggered'): f.write(f"\nGPU-IDLE WATCHDOG: every GPU slot under {receipt['gpu_idle_watchdog']['util_percent']} % utilisation for {receipt['gpu_idle_watchdog']['minutes']} min; the launcher ended the job at {receipt['gpu_idle_watchdog']['triggered']} (idle since {receipt['gpu_idle_watchdog'].get('idle_since')}, {receipt['gpu_idle_watchdog']['idle_s']} s; last active by slot {receipt['gpu_idle_watchdog']['last_active_by_slot']}).\n")
         if receipt['interrupted']: f.write(f"\ninterrupted: {receipt['interrupted']}" + (" (SIGUSR1 checkpoint segment: every task exited 0; resume the next segment)" if receipt.get('checkpoint_segment') else " (not a clean checkpoint)") + "\n")
+        if receipt.get('launch_error'): f.write(f"\nLAUNCH FAILED: task {receipt['launch_error']['task']}: {receipt['launch_error']['error']}; not started: {', '.join(receipt['launch_error']['not_started'])}\n")
     print(json.dumps(dict(job=receipt['job'],mode=mode,wall_s=receipt['wall_s'],gpu_slot_hours_held=receipt['gpu_slot_hours_held'],all_ok=receipt['all_ok'],receipt=os.path.join(args.receipt_dir,'receipt.json'))))
     sys.exit(0 if receipt['all_ok'] else 1)
 

@@ -13,7 +13,7 @@ Exit codes: 0 GO; 1 REDUCE (run with the suggested, smaller settings); 2 WAIT (d
 The defaults are the rules the original fleet kept on JUPITER's login nodes, one core per worker: 12 workers when the 5-minute load
 is under 30, else 6, and at least 6 usable cores to start at all; never cores 0 and 1 (the OS and other users kept them near 100 %
 busy); a core counts as usable when it was under 50 % busy; your own memory under 20 GiB on the node; at most 16 GiB of your own on
-the login GPU while anyone else uses it, with at least 2 GiB left free. Change them with the options to suit your site.
+the login GPU while anyone else uses it (what you hold already counted with the new run), with at least 2 GiB left free. Change them with the options to suit your site.
 
 Read-only and cheap: one second of /proc/stat sampling, a few files under /proc and /sys, and nvidia-smi only when --gpu-gib is set.
 No network, no Slurm, no writes.
@@ -190,10 +190,14 @@ def main():
             others = [x for x in g['apps'] if not x['mine']]
             if a.gpu_gib + a.gpu_free_gib > free:
                 flag(2, 'the login GPU has ' + str(round(free, 1)) + ' GiB free; the run needs ' + str(a.gpu_gib) + ' plus ' + str(a.gpu_free_gib) + ' GiB left free')
-            if others and a.gpu_gib > a.gpu_own_max_gib:
-                flag(1, str(len(others)) + ' other process(es) on the login GPU: keep your run at or under ' + str(a.gpu_own_max_gib) + ' GiB, or run it as a job')
-            if a.gpu_gib > a.gpu_own_max_gib and not others:
-                flag(1, 'more than ' + str(a.gpu_own_max_gib) + ' GiB on a shared card: others can arrive mid-run; watch it, or run it as a job')
+            mine = sum((x['used_mib'] or 0) for x in g['apps'] if x['mine']) / 1024   # what the account holds already counts too
+            after = mine + a.gpu_gib
+            if others and after > a.gpu_own_max_gib:
+                flag(1, str(len(others)) + ' other process(es) on the login GPU, and you would hold ' + str(round(after, 1)) + ' GiB (' + str(round(mine, 1))
+                     + ' already, ' + str(a.gpu_gib) + ' more): keep your own at or under ' + str(a.gpu_own_max_gib) + ' GiB in all, or run it as a job')
+            if after > a.gpu_own_max_gib and not others:
+                flag(1, 'you would hold ' + str(round(after, 1)) + ' GiB on a shared card (' + str(round(mine, 1)) + ' already), more than '
+                     + str(a.gpu_own_max_gib) + ': others can arrive mid-run; watch it, or run it as a job')
 
     level = max(levels) if levels else 0
     verdict = ['GO', 'REDUCE', 'WAIT'][level]

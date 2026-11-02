@@ -49,7 +49,15 @@ wait_lock() {  # waits up to $1 seconds (default 1200) for index.lock to clear; 
 }
 lock_holders() { echo "on $(hostname -s): $(pgrep -a -x git | cut -c1-80 | head -3 | tr '\n' ';')(a holder on another login node shows no process here)"; }
 PENDING=""   # set by cmd_* to $GITDIR/lanegit-pending-<lane>.paths: paths whose shared-index update was deferred
-index_update() {  # the shared index: the named paths brought up to date (add/modify/remove), under the lock, briefly;
+committed_info() {  # --index-info lines that set the named paths to HEAD's committed versions; a path HEAD lacks is removed. The shared
+  local have p z     # index must hold what was committed: hashing the working files instead staged any edit made since the commit (a
+                    # deferred update replayed later did), and a folder commit then passed it over as unchanged
+  z=$(printf '%0*d' "$($G rev-parse HEAD | tr -d '\n' | wc -c)" 0)
+  have=$'\n'$(GIT_LITERAL_PATHSPECS=1 $G ls-tree -r --full-tree --name-only -z HEAD -- "$@" | tr '\0' '\n')$'\n'
+  GIT_LITERAL_PATHSPECS=1 $G ls-tree -r --full-tree -z HEAD -- "$@"
+  for p in "$@"; do case "$have" in *$'\n'"$p"$'\n'*) ;; *) printf '0 %s\t%s\0' "$z" "$p";; esac; done
+}
+index_update() {  # the shared index: the named paths set to their committed versions (HEAD), under the lock, briefly;
   local try=0 out  # on a busy lock the paths are recorded as pending and replayed by the lane's next status, commit or index
   while :; do
     try=$((try+1))
@@ -57,7 +65,7 @@ index_update() {  # the shared index: the named paths brought up to date (add/mo
       [ -n "$PENDING" ] && printf '%s\n' "$@" >> "$PENDING"
       echo "INDEX PENDING: index.lock held $(( ${LANEGIT_INDEX_WAIT:-120} / 60 )) minutes by another process ($(lock_holders)); the commit stands; the paths are replayed by your next status, commit or index call"; return 1
     fi
-    if out=$($G update-index --add --remove -- "$@" 2>&1); then return 0; fi
+    if out=$(committed_info "$@" | $G update-index -z --index-info 2>&1); then return 0; fi
     if printf '%s' "$out" | grep -q 'index.lock\|Unable to create'; then
       [ $try -ge 6 ] && { [ -n "$PENDING" ] && printf '%s\n' "$@" >> "$PENDING"; echo "INDEX PENDING: lock contention six times; the commit stands; the paths are replayed by your next status, commit or index call"; return 1; }
       sleep 5; continue
@@ -71,7 +79,7 @@ replay_pending() {  # $1 = lane rel: a deferred index update replayed once, with
   [ -e "$GITDIR/index.lock" ] && return 0
   local paths=() q
   while IFS= read -r q; do [ -n "$q" ] && paths+=("$q"); done < <(sort -u "$PENDING")
-  if $G update-index --add --remove -- "${paths[@]}" >/dev/null 2>&1; then rm -f "$PENDING"; echo "INDEX UPDATED (deferred): ${#paths[@]} path(s)"; fi
+  if committed_info "${paths[@]}" | $G update-index -z --index-info >/dev/null 2>&1; then rm -f "$PENDING"; echo "INDEX UPDATED (deferred): ${#paths[@]} path(s)"; fi
 }
 cmd_status() {
   [ $# -ge 1 ] || die 'usage: status <lane-folder>'
@@ -91,11 +99,12 @@ cmd_commit() {
     r=$(rel "$p") || exit 1
     case "$r/" in "$lanerel"/*) ;; *) die "path outside your lane folder ($lanerel): $p";; esac
     if [ -d "$ROOT/$r" ]; then
-      while IFS= read -r -d '' f; do files+=("$f"); done < <($G ls-files -z -m -o -d --exclude-standard -- "$r")
+      while IFS= read -r -d '' f; do files+=("$f"); done < <($G ls-files -z -m -o -d --exclude-standard -- "$r"; $G diff-index -z --cached --name-only HEAD -- "$r")   # and what is staged against HEAD
     elif [ -e "$ROOT/$r" ] || $G ls-files --error-unmatch -- "$r" >/dev/null 2>&1; then files+=("$r")
     else die "no such path: $p"; fi
   done
   [ ${#files[@]} -ge 1 ] || die 'nothing changed under the given paths'
+  mapfile -d '' files < <(printf '%s\0' "${files[@]}" | sort -zu)   # a path both changed and staged, once
   local limit=$(( ${FLEET_MAX_FILE_MB:-10} * 1024 * 1024 )) tracked=$'\n' untracked=() ign
   tracked+=$($G ls-files -z -- "${files[@]}" | tr '\0' '\n')$'\n'      # one index read for all the paths
   for f in "${files[@]}"; do

@@ -37,5 +37,20 @@ check "the cores-only form prints a core list (or nothing on WAIT)" '[ "$RC" = 2
 echo "L5. read-only"
 check "nothing written beside it but the test's own output" '[ "$(ls -A "$T" | sort | tr "\n" " ")" = "err.txt out.json " ]'
 
+echo "L6. the login GPU: what you hold already counts (a fake nvidia-smi: 10 GiB of yours on the card, someone else there too)"
+F=$(mktemp -d "${TMPDIR:-/tmp}/lc_gpu.XXXXXX"); mkdir -p "$F/bin"
+cat > "$F/bin/nvidia-smi" <<EOF
+#!/bin/bash
+case "\$*" in
+  *--query-gpu=*) echo "0, 12288, 97871, 30";;
+  *--query-compute-apps=*) echo "$$, 10240"; echo "1, 2048";;
+esac
+EOF
+chmod +x "$F/bin/nvidia-smi"
+gr(){ PATH="$F/bin:$PATH" python3 "$LC" --gpu-gib "$1" --json 2>/dev/null | python3 -c 'import json,sys; print(" | ".join(json.load(sys.stdin)["reasons"]))'; }
+R10=$(gr 10); R4=$(gr 4); rm -rf "${F:?}"
+check "10 GiB more with 10 GiB held and others on the card: over the 16 GiB rule, named" 'echo "$R10" | grep -q "you would hold 20.0 GiB (10.0 already, 10.0 more)"'
+check "4 GiB more (14 GiB in all): no objection from the GPU rule" '! echo "$R4" | grep -q "you would hold"'
+
 echo; echo "LOGIN CHECK RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ]

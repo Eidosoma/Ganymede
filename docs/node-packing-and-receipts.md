@@ -71,11 +71,11 @@ Size sidecars to end with the GPU work. The launcher refuses an idle GPU at the 
 
 ## Signals and checkpoints
 
-Slurm sends `SIGUSR1` `SIGNAL_BEFORE_END` seconds before the limit. The batch shell forwards it to the launcher, which forwards it to every task's process group. A task should save its state, exit 0, and support `--resume`. If every task then exits 0, the receipt says `checkpoint_segment: true` and `all_ok` stays true: the contract worked, and the next segment is a new job. `SIGTERM` (a cancel, the watchdog) is forwarded too; after `--grace` seconds (60) whatever is left is killed, and the job is a failure.
+Slurm sends `SIGUSR1` `SIGNAL_BEFORE_END` seconds before the limit. The batch shell forwards it to the launcher, which forwards it to every task's process group. A task should save its state, exit 0, and support `--resume`. If every task then exits 0, the receipt says `checkpoint_segment: true` and `all_ok` stays true: the contract worked, and the next segment is a new job. `SIGTERM` (a cancel, the watchdog) is forwarded too; after `--grace` seconds (60) whatever is left is killed, and the job is a failure. Every process of a task's group gets the signal, and the task's shell waits for the running command, exits with its status and starts nothing more, so a compound command (`python train.py; echo done`) checkpoints like a single one. A program killed by signal N reads exit 128+N.
 
 ## The GPU-idle watchdog
 
-With sampling on (`--sample`), when every GPU slot has read under `--idle-gpu-util` percent (1) for `--idle-gpu-minutes` (45), counted from the job's start, the launcher ends the job as if by `SIGTERM`. The receipt's `gpu_idle_watchdog` records `triggered`, `idle_since`, `idle_s` and `last_active_by_slot`; `interrupted.signal` is 15 and `all_ok` is false; the Slurm job log gets a timestamped `GPU-IDLE WATCHDOG` line. A sample that cannot be read counts as active, never as idle. The window and threshold belong in the site file's `PACK_EXTRA`; a spec cannot change them, and `--idle-gpu-minutes 0` disables the watchdog.
+With sampling on (`--sample`), when every GPU slot has read under `--idle-gpu-util` percent (1) for `--idle-gpu-minutes` (45), counted from the job's start, the launcher ends the job as if by `SIGTERM`. The receipt's `gpu_idle_watchdog` records `triggered`, `idle_since`, `idle_s` and `last_active_by_slot`; `interrupted.signal` is 15 and `all_ok` is false; the Slurm job log gets a timestamped `GPU-IDLE WATCHDOG` line. A sample counts toward the window only when every slot was read and read under the threshold: GPM for each slot, `nvidia-smi` for a slot GPM misses. A sample in which any slot could not be read counts as active, never as idle (`unread_samples` counts them). The window and threshold belong in the site file's `PACK_EXTRA`; a spec cannot change them, and `--idle-gpu-minutes 0` disables the watchdog.
 
 A watchdog-ended job is a failure to read: a runner waiting for work that can never arrive, a trainer hung at exit, or a long CPU phase that belongs off the GPU nodes.
 
@@ -90,6 +90,7 @@ A watchdog-ended job is a failure to read: a runner waiting for work that can ne
 | `pools[]` | per pool: commands, completed, failed, workers, cores, command-seconds |
 | `wall_s`, `gpu_slot_hours_held` | wall time; slots times wall time |
 | `all_ok`, `checkpoint_segment`, `interrupted` | the verdict: every task exited 0 (and every pool command), whether this was a clean checkpoint segment, which signal ended it |
+| `launch_error` | a task that could not be started: which one, why, and the tasks never started; the ones already started were stopped |
 | `gpu_summary` | per GPU slot, means over the job: `gpu_util`, `sm_active`, `sm_occupancy`, `tensor_active`, `dram_bw`, `busy_fraction`, `peak_mem_mib`, and the `source` (`gpm` or `nvidia-smi`) |
 | `gpu_imbalance` | true when the slots' busy fractions differ by 0.5 or more |
 | `gpm_samples`, `gpu_samples`, `cpu_samples` | the raw samples (large; drop them when committing a receipt, as a `receipt.slim.json`) |
@@ -128,4 +129,4 @@ Without the `nvidia-ml-py` package, or on GPUs without GPM, the summary comes fr
 | `--grace S` | 60 | seconds between `SIGTERM` and `SIGKILL` |
 | `--dry-run` | | print the plan, start nothing |
 
-Exit code: 0 if every task exited 0 (a clean checkpoint segment included), 1 otherwise, 2 for a spec refused by the packing rule.
+Exit code: 0 if every task exited 0 (a clean checkpoint segment included), 1 otherwise, 2 for a refused spec (the packing rule, or a task folder that does not exist: checked before anything starts).

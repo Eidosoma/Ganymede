@@ -1,0 +1,14 @@
+# The test suite on every push and pull request: a fake Slurm, throwaway git repositories, no scheduler and no GPU.
+# The run fails when any check fails (the suite's exit status).
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  fleet-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: run_tests.sh
+        run: bash tests/fleet_guard/run_tests.sh
