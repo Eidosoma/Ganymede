@@ -30,21 +30,18 @@ if [ "${FLEET_LOCK_HELD:-0}" != 1 ]; then
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if mkdir "$LOCK" 2>/dev/null; then GOT=1; break; fi
     AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || date +%s) ))
-    if [ "$AGE" -gt 180 ]; then rmdir "$LOCK" 2>/dev/null || true; continue; fi
+    if [ "$AGE" -gt "${FLEET_LOCK_STALE_S:-180}" ]; then rmdir "$LOCK" 2>/dev/null || true; continue; fi
     python3 -c "import time; time.sleep(1)"
   done
   [ $GOT = 1 ] || { say "fleet lock busy: nothing done (the next pass will do it)"; exit 0; }
   trap unlock EXIT
 fi
-SNAP=$(squeue -A "$ACCOUNT" -h -t PD,R,CF,CG -o '%A|%D|%t|%E|%r|%F|%j' 2>/dev/null) || { say "the queue could not be read: nothing done"; exit 0; }
-# nodes in flight: running and configuring jobs, pending jobs that are free to start, and, when a job is leaving, its chained
-# successors (they start the moment it ends); the leaving job itself is not counted
-INFLIGHT=$(printf '%s\n' "$SNAP" | awk -F'|' -v dep="$DEPARTING" '
-  $1==dep {next}
-  $3=="R"||$3=="CF" {n+=$2; next}
-  $3=="PD" && ($4==""||$4=="(null)") && $5!~/Held/ {n+=$2; next}
-  $3=="PD" && dep!="" && $5!~/Held/ && $4 ~ ("(^|[:,?])" dep "([(:,?_]|$)") {n+=$2}
-  END {print n+0}')
+SNAP=$(SLURM_BITSTR_LEN=0 squeue -A "$ACCOUNT" -h -t all -o '%A|%D|%t|%E|%r|%F|%j|%i' 2>/dev/null) || { say "the queue could not be read: nothing done"; exit 0; }
+# nodes in flight (slurm/inflight.py, shared with submit.sh): running and configuring jobs, pending jobs that are free to start (the
+# pending part of an array: the elements its throttle lets run at once), when a job is leaving its chained successors (they start
+# the moment it ends), and accepted jobs the queue does not show yet (their reservations); the leaving job itself is not counted.
+# Every state is read (-t all), so a job that has just ended is seen as ended, and whole task lists (SLURM_BITSTR_LEN=0).
+INFLIGHT=$(printf '%s\n' "$SNAP" | python3 "$HERE/inflight.py" --fields A,D,t,E,r,F,j,i --departing "$DEPARTING" --reservations "${FLEET_RESERVATIONS_FILE:-$JDIR/receipts/FLEET_RESERVATIONS.log}") || { say "the nodes in flight could not be computed: nothing done"; exit 0; }
 RELEASED=0; RELIDS=""
 while IFS='|' read -r TS JID NAME NODES _; do
   [ -n "${JID:-}" ] || continue

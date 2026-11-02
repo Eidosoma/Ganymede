@@ -20,7 +20,7 @@ Clone the repository into project space that compute nodes can read, for example
 bash tests/fleet_guard/run_tests.sh
 ```
 
-The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 56 passed, 0 failed`.
+The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 89 passed, 0 failed`.
 
 ## 4. Write your site file
 
@@ -36,7 +36,7 @@ Fill in at least `ACCOUNT`, `PARTITION`, `GPUS_PER_NODE`, `CPUS_PER_NODE`, `MAX_
 cp caps.example.json caps.json
 ```
 
-One entry per lane tag, in GPU-hours. A job whose name starts with a tag that has no cap is refused.
+One entry per lane tag, in GPU-hours. A job whose name starts with a tag that has no cap is refused, and until `caps.json` exists every submission is.
 
 ## 6. Try the launcher without a scheduler
 

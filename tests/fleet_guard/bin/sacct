@@ -1,5 +1,6 @@
 #!/bin/bash
 echo "$*" >> "$FAKE/sacct_calls.txt"
+if [ -e "$FAKE/sacct_slow" ]; then s=$(cat "$FAKE/sacct_slow"); rm -f "$FAKE/sacct_slow"; sleep "$s"; fi   # one slow answer
 [ -e "$FAKE/sacct_fail" ] && exit 1
 [ -f "$FAKE/sacct.txt" ] && cat "$FAKE/sacct.txt"
 exit 0

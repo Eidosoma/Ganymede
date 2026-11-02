@@ -35,15 +35,15 @@ We are sharing it early because everyone running agent fleets is learning the sa
 
 ## What it gives you
 
-- **One door to Slurm.** [`slurm/submit.sh`](slurm/submit.sh) checks every submission: a GPU-hour cap per lane (agent), a fleet ceiling on nodes in flight with a first-in-first-out queue, a hold for human review above a cost threshold, and guards against duplicate jobs, submit storms, unthrottled arrays and requeues. Every guard fails closed: if Slurm cannot be read, nothing is submitted.
+- **One door to Slurm.** [`slurm/submit.sh`](slurm/submit.sh) checks every submission: a required GPU-hour cap per lane (agent), checked and reserved inside one fleet-wide lock so concurrent submissions cannot share headroom, a fleet ceiling on nodes in flight (an array counted by what its throttle lets run at once) with a first-in-first-out queue, a hold for human review above a cost threshold, and guards against duplicate jobs, submit storms, unthrottled arrays and requeues. Every guard fails closed: if Slurm cannot be read, nothing is submitted.
 - **Whole-node packing.** [`pack_node.py`](pack_node.py) runs one task per GPU plus CPU sidecars and command pools on the spare cores, pins cores (NUMA-local on GH200), forwards Slurm's checkpoint warning to every task, and refuses a spec that would leave a GPU idle.
 - **A receipt for every job.** Per task: wall time, exit code, CPU seconds, peak memory. Per GPU: utilisation and active SMs from the Hopper GPM counters, sampled through the course of the job. Every GPU-hour has evidence behind it.
 - **A GPU-idle watchdog.** A job whose GPUs all sit under 1 % for 45 minutes is ended and recorded as a failure, so a stalled runner cannot burn a node for hours.
 - **Accounting that holds up, lightly.** Budget by lane from Slurm accounting, read for your account only in weekly windows with finished weeks cached, so a check costs the shared scheduler almost nothing; an allocation ledger, a one-screen fleet status, and a waiter that trusts the scheduler only when accounting agrees.
-- **Many agents, one git checkout.** [`git/lanegit.sh`](git/lanegit.sh) gives every agent short, scoped commits that never refresh the whole index under the lock, and pushes that never touch the working tree. [`git/ffscoped.py`](git/ffscoped.py) brings outside work in without a race. Size hooks keep outputs out of git.
+- **Many agents, one git checkout.** [`git/lanegit.sh`](git/lanegit.sh) gives every agent short, scoped commits that never refresh the whole index under the lock, and pushes that never touch the working tree. [`git/ffscoped.py`](git/ffscoped.py) brings outside work into the shared checkout, touching only the changed paths and never overwriting a write made while it runs (the writers of the paths its dry run lists pause meanwhile). Size hooks keep outputs out of git.
 - **An operating model.** [`docs/operating-model.md`](docs/operating-model.md) describes how the original fleet ran: a human gives one word per job, the word is recorded verbatim with its time, and a reviewer agent checks the books.
 - **Light on the login nodes.** Agents live on shared login nodes. [`tools/login_check.py`](tools/login_check.py) looks before anything heavy runs there: load, the least-busy cores, your memory against your per-user limit, other users on the login GPU. It answers GO, REDUCE or WAIT with the command prefix to use; [`docs/login-nodes.md`](docs/login-nodes.md) has the rules the fleet kept.
-- **Tested against a fake Slurm.** [`tests/fleet_guard/run_tests.sh`](tests/fleet_guard/run_tests.sh) runs 56 checks on any laptop, with no scheduler and no GPU.
+- **Tested against a fake Slurm.** [`tests/fleet_guard/run_tests.sh`](tests/fleet_guard/run_tests.sh) runs 89 checks on any laptop, with no scheduler and no GPU.
 
 ## How a job flows
 
@@ -79,7 +79,7 @@ Slurm records a job as failed when its batch step exits non-zero, which here mea
 
 ```bash
 git clone <this repository> ganymede && cd ganymede
-bash tests/fleet_guard/run_tests.sh                     # 56 checks against a fake Slurm: RESULT: 56 passed, 0 failed
+bash tests/fleet_guard/run_tests.sh                     # 89 checks against a fake Slurm: RESULT: 89 passed, 0 failed
 python3 tools/login_check.py                             # look before you run anything heavy on a login node
 cp slurm/site.example.env slurm/site.mysite.env          # fill in account, partition, GPUs and cores per node
 cp caps.example.json caps.json                           # one GPU-hour cap per lane tag
@@ -120,7 +120,7 @@ The full walk-through is [`docs/quickstart.md`](docs/quickstart.md).
 pack_node.py              the node launcher: one task per GPU, sidecars, pools, signals, receipts, watchdog
 slurm/                    submit.sh, node.sbatch, budget.py, fleet_dispatch.sh, wait_jobs.py, fleet_status.sh, jobs.sh,
                           ledger_from_sacct.py, copyback.sh, site files (example, JUPITER, local stand-in)
-git/                      lanegit.sh (many agents, one checkout), ffscoped.py (merge from outside without a race)
+git/                      lanegit.sh (many agents, one checkout), ffscoped.py (bring outside work in, scoped to the changed paths)
 git-hooks/                pre-commit and pre-push size guards, install.sh
 probes/                   smoke test, GPU-metrics calibration, GPM sampler, multi-node NCCL test
 tools/                    login_check.py: look before you run on a shared login node

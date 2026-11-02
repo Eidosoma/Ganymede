@@ -8,3 +8,8 @@ slurm/site.*.env
 !slurm/site.jupiter.env
 !slurm/site.local.env
 ALLOCATION_LEDGER.md
+
+# Unselected generated logo concepts retained locally
+/docs/assets/ganymede-logo.png
+/docs/assets/ganymede-logo-01-cosmic-cupbearer.png
+/docs/assets/ganymede-logo-02-eagle-and-drink.png

@@ -2,7 +2,7 @@
 
 ## 0.1.0 (unreleased)
 
-The first public release, extracted from the tooling of a fleet of AI agents supporting research and development on JUPITER Booster (internal version 1.3.11, 2 November 2026).
+The first public release, extracted from the tooling of a fleet of AI agents supporting research and development on JUPITER Booster (internal version 1.3.14, 2 November 2026).
 
 Included: the node launcher (`pack_node.py`), the submit wrapper and its guards, the fleet queue and dispatcher, the budget check, the waiter, the status screens, the allocation ledger, the copy-back helper, the git tools (`lanegit.sh`, `ffscoped.py`) and size hooks, the probes, example specs, agent instruction templates, the test suite with its fake Slurm, and the documentation.
 
@@ -20,12 +20,15 @@ Changed for the public release:
 - `probes/` (formerly the calibration lane's folder); a generic smoke test.
 - The tests use their own site file and neutral lane tags.
 
-New in the public release: `tools/login_check.py` and `docs/login-nodes.md`, the fleet's login-node practice as a tool and a page: look before you run (load, least-busy cores, memory against the per-user limit, other users on the login GPU), then run with what the check allows. Tested by `tests/fleet_guard/test_login_check.sh` (run_tests.sh section 21).
+New in the public release: `tools/login_check.py` and `docs/login-nodes.md`, the fleet's login-node practice as a tool and a page: look before you run (load, least-busy cores, memory against the per-user limit, other users on the login GPU), then run with what the check allows. Tested by `tests/fleet_guard/test_login_check.sh` (run_tests.sh section 24).
 
 ## Internal history
 
 The versions below were the internal releases during the first deployment, September to November 2026.
 
+- **1.3.14**: the scoped fast-forward never overwrites or deletes a write made while it runs: each file is moved aside and checked again, origin's version is linked in only where nothing appeared, and a change after the check is put back or kept and stops the round before main moves; files must be quiet for a minute, and the dry run lists the paths whose writers pause. A submission needs a valid caps file and a finite, non-negative cap for its lane (both found in a review of this release: an edit made during an update was silently overwritten, and a missing caps file let every lane run uncapped).
+- **1.3.13**: the node ceiling counts the pending part of an array by the elements its throttle lets run at once, through one helper shared by the wrapper and the dispatcher (`slurm/inflight.py`) that reads whole task lists; accepted jobs that the queue does not show yet count from their reservations (found in a review of this release: a pending array counted as one node, so a fleet could start more nodes than its ceiling; the budget half, a pending array charged as one task, was fixed in 1.3.12).
+- **1.3.12**: the budget check runs inside the fleet lock, which is always taken and kept fresh by its holder; each accepted job's worst case is reserved until the queue or accounting shows it; pending array tasks count one by one (found in a review of this release: two concurrent submissions could share one lane's headroom).
 - **1.3.11**: the budget check reads the account only, in weekly UTC windows, each job once, with finished windows cached (after the first run a check reads only the current week, instead of the whole period on every submit); the ledger reads the same way; the waiter polls every ten minutes by default, never faster than once a minute.
 - **1.3.10**: `git/ffscoped.py`, the scoped fast-forward of a shared checkout; `git merge` retired there.
 - **1.3.9**: the GPU-idle watchdog in every job, with a timestamped line in the job log and the idle times in the receipt.

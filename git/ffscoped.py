@@ -12,22 +12,39 @@ The route, each step guarded:
   1. fetch origin main; local main must be an ancestor of origin/main (a lane's unpushed commit: wait up to two minutes for its push,
      then refuse).
   2. for every path that differs between main and origin/main, the working file and the index entry must each equal main's version or
-     origin's (origin's = already applied by an earlier round); anything else is a lane's edit: refuse and list. Only these paths are
-     read: no whole-tree scan.
-  3. the index entries of those paths are set to origin's (update-index --index-info, which takes the lock and reads the index under
-     it), the files written from the index (checkout-index -f -u: modes and symlinks right, stat info fresh), files origin deleted
-     removed with their emptied folders. Every other index entry, a lane's staged work included, is left alone.
-  4. `update-ref refs/heads/main <origin> <old main>`: refused if a lane moved main meanwhile; then fetch again (the lane's push lands
+     origin's (origin's = already applied by an earlier round); anything else is a lane's edit: refuse and list. A file that is to be
+     replaced or removed must also have been quiet for FF_SETTLE_S seconds (60): a newer one means its writer may still be at work, so
+     the tool refuses before writing anything. Only these paths are read: no whole-tree scan.
+  3. origin's versions are written into a staging folder in .git (checkout-index from a temporary index holding only those paths:
+     modes, symlinks and filters as git writes them; the shared index is not touched yet). Then one path at a time: the working file is
+     moved into this run's backup folder (.git/ffscoped-backup/<UTC>-<pid>-<round>/files/) and checked again; if it changed after step
+     2 it is put back and the round stops. Origin's version is then put in place through a hard link (or a new symlink), which fails
+     rather than replace a file that a writer created in the meantime: the round stops and leaves that file as it is. A file origin
+     deleted is moved aside the same way, and its emptied folders are removed.
+  4. the index entries of the paths now at origin's version are set to origin's (update-index --index-info, which takes the lock and
+     reads the index under it) and their stat information refreshed (add --refresh on those paths only). Every other index entry, a
+     lane's staged work included, is left alone. The moved-aside files are checked once more: a write that landed in one after the move
+     (a writer that had the file open) stops the round, and the file is kept.
+  5. `update-ref refs/heads/main <origin> <old main>`: refused if a lane moved main meanwhile; then fetch again (the lane's push lands
      on origin within a minute) and repeat; every round is idempotent. At most three ref attempts.
+Writers: pause writes to the paths that the dry run lists while the tool runs. The tool never overwrites or deletes a write: one made
+after its check is put back, or kept in the backup folder, and the round stops before main moves (exit 11). One case only the pause
+closes: a writer that opened a file before the update and writes into it afterwards writes into the moved-aside copy, which is kept,
+and named if the write comes before the end of the run. Backups are kept FF_KEEP_DAYS (7) days; an older one whose files still match
+what was moved aside is removed at the next run, any other is kept and named.
 Exit codes: 0 done or nothing to do; 2 usage, not a checkout, or HEAD not on main; 3 local main has commits origin lacks; 4 index.lock
-held; 5 a lane's edit in the way; 6 unsupported entry (submodule, path with a newline); 8 git failure; 10 main kept moving.
+held; 5 a lane's edit in the way, or a file written in the last FF_SETTLE_S seconds (nothing changed); 6 unsupported entry (submodule,
+path with a newline); 8 git failure; 10 main kept moving; 11 a write during the run (the round stopped, main not moved, the write kept).
 
   python3 git/ffscoped.py [--dry-run]          (run it from the shared checkout, or set FF_ROOT)
 Environment: FF_ROOT (the checkout; default: the one you are in), FF_REMOTE (default origin), FLEET_GIT_TOKEN_FILE (optional token
-file for HTTPS, read only by git's credential helper and never printed). Tests only: FF_TEST_BEFORE_REF (a shell command run once just
-before the first ref update), FF_WAIT_S / FF_WAIT_TRIES (waiting for a lane's push), FF_LOCK_WAIT_S, FF_SKIP_FETCH.
+file for HTTPS, read only by git's credential helper and never printed), FF_SETTLE_S (60), FF_KEEP_DAYS (7). Tests only:
+FF_TEST_BEFORE_REF (a shell command run once just before the first ref update), FF_TEST_AFTER_ASIDE (a shell command run once after
+the first file is moved aside and checked, with FF_ASIDE naming the moved file), FF_WAIT_S / FF_WAIT_TRIES (waiting for a lane's
+push), FF_LOCK_WAIT_S, FF_SKIP_FETCH.
 """
 import os, sys, subprocess, time, stat
+import calendar, errno, json, shutil
 
 
 def _toplevel():
@@ -46,8 +63,12 @@ BASE = ['git', '-c', 'core.preloadIndex=false', '-c', 'gc.auto=0', '-c', 'mainte
 WAIT_S = float(os.environ.get('FF_WAIT_S', '30'))
 WAIT_TRIES = int(os.environ.get('FF_WAIT_TRIES', '4'))
 LOCK_WAIT_S = float(os.environ.get('FF_LOCK_WAIT_S', '120'))
+SETTLE_S = float(os.environ.get('FF_SETTLE_S', '60'))
+KEEP_DAYS = float(os.environ.get('FF_KEEP_DAYS', '7'))
 ZERO = '0' * 40
 HOOK_DONE = []
+ASIDE_HOOK_DONE = []
+COUNTER = [0]
 ENV = dict(os.environ)
 ENV.pop('GIT_OPTIONAL_LOCKS', None)   # never around an index write: it let a long-running git write back a stale index
 ENV['LC_ALL'] = 'C'
@@ -69,8 +90,8 @@ class GitError(Exception):
     pass
 
 
-def g(*args, inp=None, check=True, raw=False):
-    r = subprocess.run(BASE + list(args), cwd=ROOT, env=ENV, input=inp, capture_output=True)
+def g(*args, inp=None, check=True, raw=False, env=None):
+    r = subprocess.run(BASE + list(args), cwd=ROOT, env=env or ENV, input=inp, capture_output=True)
     if check and r.returncode != 0:
         raise GitError('git ' + ' '.join(args[:3]) + ' failed (' + str(r.returncode) + '): ' + clean(r.stderr.decode(errors='replace'))[:400])
     return r if raw else r.stdout.decode(errors='surrogateescape')
@@ -90,11 +111,11 @@ def wait_lock(gitdir):
     return True
 
 
-def with_lock_retry(gitdir, *args, inp=None):
+def with_lock_retry(gitdir, *args, inp=None, env=None):
     for attempt in range(8):
         if not wait_lock(gitdir):
             raise GitError('index.lock held over ' + str(int(LOCK_WAIT_S)) + ' s')
-        r = g(*args, inp=inp, check=False, raw=True)
+        r = g(*args, inp=inp, check=False, raw=True, env=env)
         if r.returncode == 0:
             return r
         err = r.stderr.decode(errors='replace')
@@ -164,6 +185,173 @@ def same_mode(a, b, filemode):
     return (not filemode) and {a, b} <= {'100644', '100755'}
 
 
+def eq(a, b, filemode):
+    """The same (mode, sha) state? None = nothing there; 'DIR' and 'BLOCKED' equal nothing."""
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) or isinstance(b, str):
+        return False
+    return a[1] == b[1] and same_mode(a[0], b[0], filemode)
+
+
+def state_at(loc, p, filemode):
+    """(mode, sha) of whatever is at loc, hashed as git hashes the working file p (its filters); None if nothing is there."""
+    try:
+        stt = os.lstat(loc)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISDIR(stt.st_mode):
+        return 'DIR'
+    if stat.S_ISLNK(stt.st_mode):
+        return ('120000', g('hash-object', '--stdin', inp=os.readlink(loc).encode(errors='surrogateescape')).strip())
+    mode = '100755' if (filemode and stt.st_mode & 0o100) else '100644'
+    return (mode, g('hash-object', '--path=' + p, '--', loc).strip())
+
+
+def unique(d, what):
+    COUNTER[0] += 1
+    return os.path.join(d, '.ffscoped-' + what + '-' + str(os.getpid()) + '-' + str(COUNTER[0]))
+
+
+def move_aside(full, run_dir, p):
+    """Move the working file into this run's backup folder: one rename, so whatever a writer did up to now moves with it.
+    Beside the file, hidden, if the backup folder is on another file system. Returns where it went."""
+    dest = os.path.join(run_dir, 'files', p)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    try:
+        os.rename(full, dest)
+        return dest
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    dest = unique(os.path.dirname(full), 'aside')
+    os.rename(full, dest)
+    return dest
+
+
+def copy_new(src, dst):
+    """Create dst, which must not exist (O_EXCL), with src's content; mode as a checkout creates it, in dst's own folder."""
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o777 if os.stat(src).st_mode & 0o100 else 0o666)
+    with os.fdopen(fd, 'wb') as out, open(src, 'rb') as f:
+        shutil.copyfileobj(f, out)
+
+
+def put_back(loc, full):
+    """Return a moved file to its place, never over something that appeared there meanwhile. True if it is back."""
+    try:
+        if os.path.islink(loc):
+            os.symlink(os.readlink(loc), full)
+        else:
+            os.link(loc, full)
+    except FileExistsError:
+        return False
+    except OSError:          # no hard link possible: a copy, created only if nothing is there; the moved file stays kept
+        try:
+            copy_new(loc, full)
+            return True
+        except FileExistsError:
+            return False
+    os.unlink(loc)
+    return True
+
+
+def put_new(staged, full):
+    """Put origin's version (staged) at full only if nothing is there: copied to a hidden file in the target's own folder,
+    then hard-linked to its name, which fails rather than replace a file a writer created meanwhile. True if placed."""
+    try:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+    except (FileExistsError, NotADirectoryError):
+        return False
+    if os.path.islink(staged):
+        try:
+            os.symlink(os.readlink(staged), full)
+            return True
+        except FileExistsError:
+            return False
+    tmp = unique(os.path.dirname(full), 'new')
+    copy_new(staged, tmp)
+    try:
+        os.link(tmp, full)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:          # no hard links on this file system: create it in place, still never over an existing file
+        try:
+            copy_new(staged, full)
+            return True
+        except FileExistsError:
+            return False
+    finally:
+        os.unlink(tmp)
+
+
+def materialize(gitdir, entries, stage):
+    """Origin's versions of these paths, written under stage as git's checkout writes them (modes, symlinks, filters), from a
+    temporary index that holds only them: the shared index is not touched."""
+    shutil.rmtree(stage, ignore_errors=True)
+    tmp = os.path.join(gitdir, 'ffscoped-index-' + str(os.getpid()))
+    env = dict(ENV, GIT_INDEX_FILE=tmp)
+    try:
+        g('update-index', '-z', '--index-info', env=env,
+          inp=''.join(e[0] + ' ' + e[1] + '\t' + p + '\0' for p, e in entries).encode(errors='surrogateescape'))
+        g('checkout-index', '-a', '-f', '--prefix=' + stage + '/', env=env)
+    finally:
+        for f in (tmp, tmp + '.lock'):
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass
+
+
+def note_kept(run_dir, p, loc, exp):
+    """One line in the run's manifest for each moved-aside file: the path, where it is, and what was moved aside."""
+    os.makedirs(run_dir, exist_ok=True)
+    rel = os.path.relpath(loc, run_dir) if loc.startswith(run_dir + os.sep) else loc
+    with open(os.path.join(run_dir, 'MANIFEST.jsonl'), 'a', encoding='utf-8', errors='surrogateescape') as f:
+        f.write(json.dumps({'path': p, 'loc': rel, 'mode': exp[0], 'sha': exp[1]}) + '\n')
+
+
+def prune_backups(gitdir, filemode):
+    """Remove the backups older than FF_KEEP_DAYS whose files still match what was moved aside; name the others."""
+    root = os.path.join(gitdir, 'ffscoped-backup')
+    try:
+        runs = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return
+    for d in runs:
+        run_dir = os.path.join(root, d)
+        try:
+            t = calendar.timegm(time.strptime(d.split('-')[0], '%Y%m%dT%H%M%SZ'))
+        except ValueError:
+            continue
+        if time.time() - t < KEEP_DAYS * 86400:
+            continue
+        man = os.path.join(run_dir, 'MANIFEST.jsonl')
+        try:
+            entries = [json.loads(l) for l in open(man, encoding='utf-8', errors='surrogateescape') if l.strip()]
+        except (OSError, ValueError):
+            entries = None
+        locs, same = [], entries is not None
+        for e in entries or []:
+            loc = e['loc'] if os.path.isabs(e['loc']) else os.path.join(run_dir, e['loc'])
+            now = state_at(loc, e['path'], filemode)
+            if now is not None and not eq(now, (e['mode'], e['sha']), filemode):
+                same = False
+            locs.append(loc)
+        if not same:
+            say('NOTE: backup ' + run_dir + ' kept: a file in it differs from what was moved aside, or its list is missing '
+                '(a writer may have written into it); look at it before removing it')
+            continue
+        for loc in locs:
+            if not loc.startswith(run_dir + os.sep):
+                try:
+                    os.unlink(loc)
+                except FileNotFoundError:
+                    pass
+        shutil.rmtree(run_dir, ignore_errors=True)
+        say('removed the backup ' + d + ' (older than ' + str(KEEP_DAYS).rstrip('0').rstrip('.') + ' days, unchanged)')
+
+
 def one_round(rnd, dry, gitdir, filemode):
     if os.environ.get('FF_SKIP_FETCH') != '1':
         g(*(['-c', 'credential.helper=', '-c', 'credential.helper=' + CRED] if TOKEN else []), 'fetch', '-q', REMOTE,
@@ -184,10 +372,12 @@ def one_round(rnd, dry, gitdir, filemode):
         return 'unsupported', H, O, 'a submodule entry'
     staged = raw_rows(g('diff-index', '--cached', '-r', '-z', '--no-renames', H))   # index vs main, no stat
     work = work_state(list(rows), filemode)
-    conflicts, set_index, write_work, remove_work = [], [], [], []
+    conflicts, set_index, write_work, remove_work, o_ent_of = [], [], [], [], {}
+    now = time.time()
     for p, (om, nm, osha, nsha, st) in sorted(rows.items()):
         h_ent = None if st == 'A' else (om, osha)
         o_ent = None if st == 'D' else (nm, nsha)
+        o_ent_of[p] = o_ent
         if p in staged:
             s = staged[p]
             i_ent = None if s[1] == '000000' else (s[1], s[3])
@@ -197,25 +387,30 @@ def one_round(rnd, dry, gitdir, filemode):
         if w in ('DIR', 'BLOCKED'):
             conflicts.append(('a folder in the way' if w == 'DIR' else 'a file in the way of its folder') + ': ' + p)
             continue
-        def eq(a, b):
-            if a is None or b is None:
-                return a is None and b is None
-            return a[1] == b[1] and same_mode(a[0], b[0], filemode)
-        w_h, w_o = eq(w, h_ent), eq(w, o_ent)
-        i_h, i_o = eq(i_ent, h_ent), eq(i_ent, o_ent)
+        w_h, w_o = eq(w, h_ent, filemode), eq(w, o_ent, filemode)
+        i_h, i_o = eq(i_ent, h_ent, filemode), eq(i_ent, o_ent, filemode)
         if not (w_h or w_o):
             conflicts.append(('untracked file in the way' if st == 'A' else 'edited locally') + ': ' + p)
         if not (i_h or i_o):
             conflicts.append('staged locally: ' + p)
         if not (w_h or w_o) or not (i_h or i_o):
             continue
+        if w_o:                                  # the working file is origin's version already: at most its index entry
+            if not i_o:
+                set_index.append((p, o_ent))
+            continue
+        if w is not None and SETTLE_S > 0:       # it will be replaced or removed: it must have been quiet for a while
+            try:
+                age = now - os.lstat(os.path.join(ROOT, p)).st_mtime
+            except FileNotFoundError:
+                age = SETTLE_S
+            if age < SETTLE_S:
+                conflicts.append('written ' + str(max(0, int(age))) + ' s ago, within FF_SETTLE_S=' + str(int(SETTLE_S))
+                                 + ' (its writer may be at work: pause it, then run again): ' + p)
+                continue
         if not i_o:
             set_index.append((p, o_ent))
-        if st == 'D':
-            if w is not None:
-                remove_work.append(p)
-        elif not w_o or not i_o:
-            write_work.append(p)
+        (remove_work if st == 'D' else write_work).append(p)
     say('round ' + str(rnd) + ': ' + str(behind) + ' commit(s), ' + str(len(rows)) + ' path(s) differ ('
         + str(sum(1 for r in rows.values() if r[4] == 'A')) + ' added, '
         + str(sum(1 for r in rows.values() if r[4] == 'D')) + ' deleted, '
@@ -224,31 +419,83 @@ def one_round(rnd, dry, gitdir, filemode):
         + '; conflicts ' + str(len(conflicts)))
     if conflicts:
         return 'conflict', H, O, conflicts
+    targets = sorted(write_work + remove_work)
+    tset, wset = set(targets), set(write_work)
     if dry:
+        for p in targets:
+            print(('  write  ' if p in wset else '  remove ') + p)
+        for p, _ in set_index:
+            if p not in tset:
+                print('  index  ' + p)
         return 'dry', H, O, behind
-    if set_index:
-        lines = []
-        for p, ent in set_index:
-            if ent is None:
-                lines.append('0 ' + ZERO + '\t' + p)
-            else:
-                lines.append(ent[0] + ' ' + ent[1] + '\t' + p)
-        with_lock_retry(gitdir, 'update-index', '-z', '--index-info', inp=('\0'.join(lines) + '\0').encode(errors='surrogateescape'))
-    if write_work:
-        with_lock_retry(gitdir, 'checkout-index', '-f', '-u', '-z', '--stdin', inp=('\0'.join(write_work) + '\0').encode(errors='surrogateescape'))
-    for p in remove_work:
-        full = os.path.join(ROOT, p)
-        try:
-            os.unlink(full)
-        except FileNotFoundError:
-            pass
-        d = os.path.dirname(p)
-        while d:
+    run_dir = os.path.join(gitdir, 'ffscoped-backup', time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + str(os.getpid()) + '-' + str(rnd))
+    stage = os.path.join(gitdir, 'ffscoped-stage-' + str(os.getpid()))
+    problems, done, kept = [], [], []
+    try:
+        if write_work:
+            materialize(gitdir, [(p, o_ent_of[p]) for p in write_work], stage)
+        for p in targets:
+            full = os.path.join(ROOT, p)
+            exp, loc = work[p], None
+            if exp is not None:
+                try:
+                    loc = move_aside(full, run_dir, p)
+                except FileNotFoundError:
+                    problems.append('removed during the run, after the check: ' + p)
+                    break
             try:
-                os.rmdir(os.path.join(ROOT, d))
-            except OSError:
-                break
-            d = os.path.dirname(d)
+                if loc is not None:
+                    cur = state_at(loc, p, filemode)
+                    if not eq(cur, exp, filemode):
+                        back = put_back(loc, full)
+                        if not back or os.path.lexists(loc):
+                            note_kept(run_dir, p, loc, exp)
+                        problems.append('changed during the run, after the check: ' + p + ('; the changed file is back in its place, untouched'
+                                        if back else '; a newer file is in its place, and the changed one is kept at ' + loc))
+                        break
+                    note_kept(run_dir, p, loc, exp)
+                    kept.append((p, loc, exp))
+                    hook = os.environ.get('FF_TEST_AFTER_ASIDE')
+                    if hook and not ASIDE_HOOK_DONE:
+                        ASIDE_HOOK_DONE.append(1)
+                        subprocess.run(['bash', '-c', hook], cwd=ROOT, env=dict(ENV, FF_ASIDE=loc))
+                if p in wset:
+                    if not put_new(os.path.join(stage, p), full):
+                        problems.append('a file appeared during the run: ' + p + ' (left as it is'
+                                        + ('; main\'s version, moved aside before, is kept at ' + loc if loc else '') + ')')
+                        break
+                else:
+                    d = os.path.dirname(p)
+                    while d:
+                        try:
+                            os.rmdir(os.path.join(ROOT, d))
+                        except OSError:
+                            break
+                        d = os.path.dirname(d)
+            except BaseException:            # a failure or an interrupt mid-path: the moved file goes back before anything else
+                if loc is not None and os.path.lexists(loc) and not os.path.lexists(full):
+                    put_back(loc, full)
+                raise
+            done.append(p)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    dset = set(done)
+    idx = [(p, e) for p, e in set_index if p not in tset or p in dset]
+    if idx:
+        lines = [('0 ' + ZERO if e is None else e[0] + ' ' + e[1]) + '\t' + p for p, e in idx]
+        with_lock_retry(gitdir, 'update-index', '-z', '--index-info', inp=('\0'.join(lines) + '\0').encode(errors='surrogateescape'))
+    fresh = [p for p in done if p in wset] + [p for p, e in idx if p not in tset and e is not None]
+    if fresh:
+        try:
+            with_lock_retry(gitdir, 'add', '--refresh', '--pathspec-from-file=-', '--pathspec-file-nul',
+                            inp=('\0'.join(fresh) + '\0').encode(errors='surrogateescape'), env=dict(ENV, GIT_LITERAL_PATHSPECS='1'))
+        except GitError as e:
+            say('NOTE: the stat information of the written files was not refreshed (' + str(e)[:160] + '); git status re-reads them')
+    for p, loc, exp in kept:
+        if not eq(state_at(loc, p, filemode), exp, filemode):
+            problems.append('written after it was moved aside (a writer that had it open): ' + p + '; that write is kept at ' + loc)
+    if problems:
+        return 'raced', H, O, problems
     staged2 = raw_rows(g('diff-index', '--cached', '-r', '-z', '--no-renames', O))
     left = [p for p in rows if p in staged2]
     if left:
@@ -283,6 +530,8 @@ def main():
             say('REFUSED: index.lock held over ' + str(int(LOCK_WAIT_S)) + ' s; nothing changed; try again')
             return 4
         say('ffscoped start in ' + ROOT + (' (dry run)' if dry else ''))
+        if not dry:
+            prune_backups(gitdir, filemode)
         waits, moves, rnd = 0, 0, 0
         while True:
             rnd += 1
@@ -295,7 +544,8 @@ def main():
                     + str(round(time.time() - t0, 1)) + ' s')
                 return 0
             if res == 'dry':
-                say('DRY RUN OK: nothing changed; a fast-forward of ' + str(info) + ' commit(s) would proceed')
+                say('DRY RUN OK: nothing changed; a fast-forward of ' + str(info) + ' commit(s) would proceed; pause writes to the '
+                    'paths listed above while it runs')
                 return 0
             if res == 'conflict':
                 for c in info[:50]:
@@ -304,6 +554,12 @@ def main():
                     print('  ... and ' + str(len(info) - 50) + ' more')
                 say('REFUSED: ' + str(len(info)) + ' path(s) in the way' + ('' if rnd == 1 else ' (earlier rounds applied origin\'s files; nothing of a lane\'s was touched)'))
                 return 5
+            if res == 'raced':
+                for c in info:
+                    print('  ' + c)
+                say('STOPPED: a write during the run; nothing of it was overwritten or deleted, and main was not moved. Settle the '
+                    'path(s) with their writer, then run again (paths already done stay at origin\'s version)')
+                return 11
             if res == 'unsupported':
                 say('REFUSED: ' + info + ' in the update; not handled here')
                 return 6

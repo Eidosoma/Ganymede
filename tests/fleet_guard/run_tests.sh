@@ -11,6 +11,7 @@ mkdir -p "$T/stage"; cp -r "$TOOLING/slurm" "$T/stage/"; cp "$TOOLING/VERSION" "
 STAGE="$T/stage"; export FAKE="$T/state"; export PATH="$T/bin:$PATH"
 cp "$HERE/site.test.env" "$STAGE/slurm/site.test.env" && cp "$HERE/caps.test.json" "$STAGE/caps.json" || { echo "could not stage the test site file and caps"; exit 2; }
 export FLEET_QUEUE_FILE="$T/state/FLEET_QUEUE.log" FLEET_LOCK_DIR="$T/state/.fleet.lock" FLEET_DISPATCH_LOG="$T/dispatch.log" FLEET_LOCK_WAIT=3
+export FLEET_RESERVATIONS_FILE="$T/state/FLEET_RESERVATIONS.log"   # never the live file: the staged site file names the live one
 PASS=0; FAILS=0
 ok()   { PASS=$((PASS+1)); echo "  pass: $1"; }
 bad()  { FAILS=$((FAILS+1)); echo "  FAIL: $1"; }
@@ -188,7 +189,97 @@ check "--no-cache reads every window again" '[ $((N3-N2)) = "$N1" ]'
 rm -f "$STAGE"/receipts/.budget_cache.*.json; touch "$FAKE/sacct_fail"; python3 "$STAGE/slurm/budget.py" --site test --lane "${NAME%%-*}" --est-hours 1 >/dev/null 2>&1; RC=$?
 check "accounting down: the check refuses (exit 3) and caches nothing" '[ $RC = 3 ] && ! ls "$STAGE"/receipts/.budget_cache.*.json >/dev/null 2>&1'
 
-echo "22. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "22. one locked transaction: the budget check runs inside the fleet lock, and an accepted job keeps a reservation until the queue or accounting shows it"
+setcap(){ python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c[sys.argv[2]]=float(sys.argv[3]); json.dump(c,open(p,"w"),indent=1)' "$STAGE/caps.json" "$1" "$2"; }
+nap(){ python3 -c 'import sys,time; time.sleep(float(sys.argv[1]))' "$1"; }
+reset; setcap race 4
+( FLEET_LOCK_WAIT=30 bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --name race-a-v1 "$T/spec.json" >/dev/null 2>&1; echo $? > "$T/rc_a" ) &
+( FLEET_LOCK_WAIT=30 bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --name race-b-v1 "$T/spec.json" >/dev/null 2>&1; echo $? > "$T/rc_b" ) &
+wait
+check "two concurrent 4 GPU-hour jobs under a 4 GPU-hour cap: one submitted, the other refused by the budget (exit 3)" '[ "$(cat "$T/rc_a" "$T/rc_b" | sort | tr "\n" " ")" = "0 3 " ] && [ $(calls | wc -l) = 1 ]'
+reset; setcap race 4; sub --name race-a-v1; A=$OUT
+check "the accepted job leaves a reservation of its worst case (one node at once, not held)" 'grep -q "|$A|race|4.0|01:00:00|race-a-v1|1|0$" "$FLEET_RESERVATIONS_FILE"'
+: > "$FAKE/jobs.txt"; sub --name race-b-v1
+check "while neither the queue nor accounting shows the first job, its reservation counts: refused (exit 3)" '[ $RC = 3 ] && grep -q "|$A|" "$FLEET_RESERVATIONS_FILE"'
+printf '%s\n' "$A|race-a-v1|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED" > "$FAKE/sacct.txt"; rm -f "$STAGE"/receipts/.budget_cache.*.json
+sub --name race-c-v1
+check "once accounting shows it finished, its reservation is dropped and its 4 used GPU-hours hold the cap: refused" '[ $RC = 3 ] && ! grep -q "|$A|" "$FLEET_RESERVATIONS_FILE"'
+reset; setcap race 4; echo "2026-01-01T00:00:00Z|99999|race|4.0|01:00:00|race-old-v1" > "$FLEET_RESERVATIONS_FILE"; sub --name race-d-v1
+check "a reservation a day past its time limit, never seen in the queue or accounting, expires: accepted" '[ $RC = 0 ] && ! grep -q "|99999|" "$FLEET_RESERVATIONS_FILE"'
+reset; setcap race 40; echo "777_[0-8%1]|777|1|PD|(null)|None|2026-09-20T10:00:00|race-arr-v1|1:00:00|0:00" > "$FAKE/jobs.txt"
+C=$(python3 "$STAGE/slurm/budget.py" --site test --json 2>/dev/null | python3 -c 'import json,sys; print([r["committed"] for r in json.load(sys.stdin) if r["lane"]=="race"][0])')
+check "a pending array counts every task: 9 tasks x 4 GPUs x 1 hour = 36 GPU-hours committed" '[ "$C" = 36.0 ]'
+reset; setcap race 100; echo 6 > "$FAKE/sacct_slow"
+( FLEET_LOCK_STALE_S=3 FLEET_LOCK_WAIT=30 bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --name race-e-v1 "$T/spec.json" >/dev/null 2>&1; echo $? > "$T/rc_e" ) &
+nap 2; FLEET_LOCK_STALE_S=3 FLEET_LOCK_WAIT=3 bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --name race-f-v1 "$T/spec.json" >/dev/null 2>&1; RCF=$?
+wait
+check "a slow budget read keeps the lock fresh: a second submitter with a 3-second stale limit does not take it over (exit 4); the first is submitted" '[ "$RCF" = 4 ] && [ "$(cat "$T/rc_e")" = 0 ] && [ $(calls | wc -l) = 1 ]'
+
+echo "23. two calculations: the budget charges every pending array element; the node ceiling counts what may run at once"
+arow(){ echo "$1|$2|${3:-1}|$4|(null)|${5:-None}|2026-09-20T10:00:00|${6:-other-arr-$2}|1:00:00|0:00" >> "$FAKE/jobs.txt"; }
+reset; setcap race 12; arow "800_[0-2%3]" 800 1 PD None race-arr-v1; sub --name race-next-v1
+check "budget: three pending 4 GPU-hour elements fill a 12 GPU-hour cap; another 4 GPU-hour job is refused (exit 3)" '[ $RC = 3 ]'
+reset; arow "801_[0-3%4]" 801 1 PD; sub --name alpha-after-arr-v1
+check "ceiling: a pending 0-3%4 array may start four nodes at once; the next one-node job is held and queued, not started on a fifth" 'calls | grep -q -- "--hold" && grep -q "|$OUT|alpha-after-arr-v1|1$" "$FLEET_QUEUE_FILE"'
+reset; arow "802_[0-99%1]" 802 1 PD; sub --name alpha-beside-v1
+check "ceiling: a pending 100-element %1 array uses one node at a time; the next job starts without a hold" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+reset; arow "803_[2-9%2]" 803 1 PD; arow 803_0 803 1 R; arow 803_1 803 1 R; job 101; job 102; sub --name alpha-full-v1
+check "ceiling: two running elements use up the %2 throttle; with two other jobs the fleet is full and the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+reset; arow "803_[2-9%2]" 803 1 PD; arow 803_0 803 1 R; arow 803_1 803 1 R; job 101; sub --name alpha-room-v1
+check "ceiling: the same array with one other job leaves a node free; the next job starts without a hold" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+reset; arow "804_[2-9%3]" 804 1 PD; arow 804_0 804 1 R; arow 804_1 804 1 R; job 101
+echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 804_0 --quiet
+check "dispatch: an element leaving a %3 array lets two pending elements run; no node is free, nothing is released" '[ ! -s "$FAKE/scontrol_calls.txt" ]'
+reset; job 101; job 102; job 103; job 104; mkdir -p "$T/arrspec"; for i in 0 1 2 3; do cp "$T/spec.json" "$T/arrspec/node_$i.json"; done
+Q=$(bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --array 0-3%2 --spec-dir "$T/arrspec" 2>/dev/null)
+check "held: a 0-3%2 array submitted to a full fleet is held and queued for two nodes" 'calls | grep -q -- "--hold" && grep -q "|$Q|alpha-test-v1|2$" "$FLEET_QUEUE_FILE"'
+grep -v -e "^101|" -e "^102|" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "released: when two nodes free, the dispatcher releases the array" 'grep -q "^release $Q$" "$FAKE/scontrol_calls.txt"'
+sub --name alpha-after-release-v1
+check "released, still pending: the array counts its two possible elements, so the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+grep -v "^${Q}_\[" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"; arow "${Q}_[2-3%2]" "$Q" 1 PD; arow "${Q}_0" "$Q" 1 R; arow "${Q}_1" "$Q" 1 R
+sub --name alpha-while-running-v1
+check "running: two elements running use up the throttle; the fleet stays full and the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+reset; echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1; sub --name alpha-bitstr-v1
+check "the dispatcher and the guard both read whole task lists (squeue with SLURM_BITSTR_LEN=0)" 'grep -q "^BITSTR=0 .*%A|%D|%t|%E|%r|%F|%j|%i" "$FAKE/squeue_calls.txt" && grep -q "^BITSTR=0 .*%D|%t|%E|%r|%V|%F|%j|%i" "$FAKE/squeue_calls.txt"'
+reset; arow "805_[0-3,5,7,...%4]" 805 1 PD; sub --name alpha-trunc-v1
+check "a task list cut short with its throttle shown counts the throttle in full (four nodes): the next job is held" 'calls | grep -q -- "--hold"'
+reset; arow "806_[0-3,5,7,9,11,13,15,17" 806 1 PD; sub --name alpha-cut-v1
+check "a task list cut short with no throttle shown cannot be counted: refused (exit 4), nothing submitted" '[ $RC = 4 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "could not be computed"'
+rq(){ reset; job 101; job 102; job 103; echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1; }
+rq; echo "$(date -u +%FT%TZ)|950|alpha|4.0|01:00:00|alpha-res-v1|1|0" > "$FLEET_RESERVATIONS_FILE"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "a job accepted moments ago that the queue does not show yet counts: with three running, the waiting job is not released" '[ ! -s "$FAKE/scontrol_calls.txt" ]'
+rq; job 950 1 CD; echo "$(date -u +%FT%TZ)|950|alpha|4.0|01:00:00|alpha-res-v1|1|0" > "$FLEET_RESERVATIONS_FILE"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "the same job already ended, and the queue shows it ended: not counted; the waiting job is released" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt"'
+rq; echo "$(date -u -d "-300 seconds" +%FT%TZ)|950|alpha|4.0|01:00:00|alpha-res-v1|1|0" > "$FLEET_RESERVATIONS_FILE"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "a reservation older than two minutes whose job the queue does not show is not counted: released" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt"'
+rq; echo "$(date -u +%FT%TZ)|950|alpha|4.0|01:00:00|alpha-res-v1|1|1" > "$FLEET_RESERVATIONS_FILE"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "a job submitted held or chained cannot start by itself, so its reservation is not counted: released" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt"'
+
+echo "24. the budget check needs a valid caps file and a usable cap for the submitting lane"
+cp "$STAGE/caps.json" "$T/caps.saved"
+reset; rm -f "$STAGE/caps.json"; sub --name mystery-uncapped-v1
+check "no caps file: refused (exit 3), sbatch never called" '[ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "no caps file"'
+reset; echo '{}' > "$STAGE/caps.json"; sub --name mystery-uncapped-v1
+check "an empty caps file: refused (exit 3)" '[ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "names no lane"'
+reset; echo '{"mystery": 10' > "$STAGE/caps.json"; sub --name mystery-uncapped-v1
+check "an unreadable caps file: refused (exit 3)" '[ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "cannot be read"'
+reset; echo '[10]' > "$STAGE/caps.json"; sub --name mystery-uncapped-v1
+check "a caps file that is not an object of lane: hours: refused (exit 3)" '[ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "not a JSON object"'
+N=0; for v in NaN Infinity -1 '"100"' true null; do reset; echo "{\"mystery\": $v, \"other\": 100}" > "$STAGE/caps.json"; sub --name mystery-uncapped-v1; [ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && N=$((N+1)); done
+check "a cap that is not a finite, non-negative number (NaN, Infinity, -1, a string, true, null): each refused" '[ $N = 6 ]'
+reset; echo '{"other": 100}' > "$STAGE/caps.json"; sub --name mystery-uncapped-v1
+check "a lane with no cap beside lanes that have one: refused, as before" '[ $RC = 3 ] && echo "$ERR" | grep -q "has no cap"'
+reset; echo '{"mystery": 0}' > "$STAGE/caps.json"; sub --name mystery-zero-v1
+check "a cap of 0 is a cap: the 4 GPU-hour job would exceed it, refused (exit 3)" '[ $RC = 3 ] && echo "$ERR" | grep -q "would exceed its cap"'
+reset; rm -f "$STAGE/caps.json"; sub --name mystery-uncapped-v1 --over-cap-ok
+check "the deliberate override, --over-cap-ok, still submits without a caps file" '[ $RC = 0 ] && [ -s "$FAKE/sbatch_calls.txt" ]'
+reset; rm -f "$STAGE/caps.json"; J=$(python3 "$STAGE/slurm/budget.py" --site test --json 2>/dev/null); JRC=$?
+check "the table without a caps file still works (exit 0, JSON)" '[ $JRC = 0 ] && echo "$J" | python3 -c "import json,sys; json.load(sys.stdin)"'
+cp "$T/caps.saved" "$STAGE/caps.json"
+
+echo "25. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"

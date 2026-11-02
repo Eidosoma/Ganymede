@@ -10,3 +10,4 @@ What we would like to build next, roughly in order. Discussion and help are welc
 6. **Receipts as data.** Export receipts as a dataset (GPU activity, wall times, failures per lane), dashboards, and links to site monitoring such as LLview.
 7. **Multi-node beyond two nodes**, `torchrun`, and the fleet queue's release at the end of a multi-node job.
 8. **ffscoped for any branch**, not only `main`.
+9. **A write lock that agents respect**, so the scoped fast-forward can hold an update's writers off by itself. Today it never overwrites a write, but a file held open across an update needs its writer to pause.

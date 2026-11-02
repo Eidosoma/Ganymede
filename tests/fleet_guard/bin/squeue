@@ -1,13 +1,18 @@
 #!/bin/bash
 # fake squeue over $FAKE/jobs.txt: A|F|D|t|E|r|V|j|l|M  (unique id|base id|nodes|state|dependency|reason|submit|name|limit|elapsed)
+[ -d "$FAKE" ] && echo "BITSTR=${SLURM_BITSTR_LEN-unset} $*" >> "$FAKE/squeue_calls.txt"   # each call, with the task-list length setting
 [ -e "$FAKE/squeue_fail" ] && { echo "slurm_load_jobs error: Socket timed out" >&2; exit 1; }
-FMT='%i'; STATES='PD,R,CF,CG'; IDS=''
-while [ $# -gt 0 ]; do case "$1" in -o) FMT="$2"; shift 2;; -t) STATES="$2"; shift 2;; -j) IDS="$2"; shift 2;; -A|-u|-n) shift 2;; *) shift;; esac; done
+FMT='%i'; STATES='PD,R,CF,CG'; IDS=''; R=0
+while [ $# -gt 0 ]; do case "$1" in -o) FMT="$2"; shift 2;; -t) STATES="$2"; shift 2;; -j) IDS="$2"; shift 2;; -r) R=1; shift;; -A|-u|-n) shift 2;; *) shift;; esac; done
 [ -f "$FAKE/jobs.txt" ] || exit 0
 while IFS='|' read -r A F D t E r V j l M; do
   [ -n "$A" ] || continue
   if [ "$STATES" != all ]; then case ",$STATES," in *",$t,"*) ;; *) continue;; esac; fi
   if [ -n "$IDS" ]; then case ",$IDS," in *",$F,"*|*",$A,"*) ;; *) continue;; esac; fi
-  out="$FMT"; out="${out//%A/$A}"; out="${out//%F/$F}"; out="${out//%i/$A}"; out="${out//%D/$D}"; out="${out//%t/$t}"; out="${out//%E/$E}"; out="${out//%r/$r}"; out="${out//%V/$V}"; out="${out//%j/$j}"; out="${out//%l/$l}"; out="${out//%M/$M}"; out="${out//%b/gres/gpu:4}"
+  ids="$A"   # -r: a collapsed pending array (N_[a-b%t]) is listed one task a line, as real squeue does
+  if [ "$R" = 1 ] && [[ $A =~ ^([0-9]+)_\[([0-9]+)-([0-9]+)(%[0-9]+)?\]$ ]]; then ids=""; for ((k=${BASH_REMATCH[2]}; k<=${BASH_REMATCH[3]}; k++)); do ids="$ids ${BASH_REMATCH[1]}_$k"; done; fi
+  for a in $ids; do
+  out="$FMT"; out="${out//%A/$a}"; out="${out//%F/$F}"; out="${out//%i/$a}"; out="${out//%D/$D}"; out="${out//%t/$t}"; out="${out//%E/$E}"; out="${out//%r/$r}"; out="${out//%V/$V}"; out="${out//%j/$j}"; out="${out//%l/$l}"; out="${out//%M/$M}"; out="${out//%b/gres/gpu:4}"
   echo "$out"
+  done
 done < "$FAKE/jobs.txt"

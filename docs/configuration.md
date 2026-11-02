@@ -28,6 +28,8 @@
 | `FLEET_QUEUE_FILE` | `"${FLEET_QUEUE_FILE:-/shared/receipts/FLEET_QUEUE.log}"` | submit, dispatch | the fleet queue (default `receipts/FLEET_QUEUE.log` beside the tooling) |
 | `FLEET_LOCK_DIR` | `"${FLEET_LOCK_DIR:-/shared/receipts/.fleet.lock}"` | submit, dispatch | the fleet lock |
 | `FLEET_DISPATCH_LOG` | `"${FLEET_DISPATCH_LOG:-/shared/receipts/FLEET_DISPATCH.log}"` | dispatch | the release log |
+| `FLEET_RESERVATIONS_FILE` | `"${FLEET_RESERVATIONS_FILE:-/shared/receipts/FLEET_RESERVATIONS.log}"` | submit, budget, dispatch | accepted jobs' worst cases until the queue or accounting shows them |
+| `FLEET_RESERVATION_RECENT_S` | `120` (environment) | submit, dispatch | seconds an accepted job that the queue does not show yet counts toward the ceiling; keep it below Slurm's `MinJobAge` |
 
 The duplicate, rate and ceiling guards run only when `squeue` is available and at least one of `MAX_NODES_IN_FLIGHT`, `NO_DUPLICATE_NAMES` and `MAX_SUBMITS_PER_10MIN` is set.
 
@@ -35,10 +37,11 @@ The duplicate, rate and ceiling guards run only when `squeue` is available and a
 
 | file | meaning |
 |---|---|
-| `caps.json` | GPU-hour caps per lane tag ([budget-and-accounting.md](budget-and-accounting.md)) |
+| `caps.json` | GPU-hour caps per lane tag, required for every submission ([budget-and-accounting.md](budget-and-accounting.md)) |
 | `receipts/<name>-<jobid>/` | one folder per job: `receipt.json`, `receipt.md`, one `.out` and `.err` per task |
 | `receipts/JOBS.log` | one line per job start and end: `START`, `DONE`, `FAILED`, `REFUSED` |
 | `receipts/FLEET_QUEUE.log`, `FLEET_DISPATCH.log` | the fleet queue and the dispatcher's releases (unless the site file moves them) |
+| `receipts/FLEET_RESERVATIONS.log` | accepted jobs' reservations (unless the site file moves it) |
 | `receipts/.budget_cache.<site>.json` | the budget check's finished accounting windows; rebuilt by itself when absent |
 | `logs/<name>-<jobid>.out`, `.err` | Slurm's output for the batch script and the launcher |
 
@@ -47,6 +50,7 @@ The duplicate, rate and ceiling guards run only when `squeue` is available and a
 | variable | used by | meaning |
 |---|---|---|
 | `FLEET_LOCK_WAIT` | submit | seconds to wait for the fleet lock (45) |
+| `FLEET_LOCK_STALE_S` | submit, dispatch | a lock nobody has refreshed for this many seconds is stale (180); its holder refreshes it every third of that |
 | `FLEET_QUEUE_FILE`, `FLEET_LOCK_DIR`, `FLEET_DISPATCH_LOG` | submit, dispatch | override the site file (the tests use this) |
 | `LANEGIT_ROOT` | lanegit | the shared checkout (default: the one you are in) |
 | `LANEGIT_LANES_PREFIX` | lanegit | the folder lane folders live in, for `check` |

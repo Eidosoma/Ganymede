@@ -27,6 +27,17 @@ mk() {
   cd "$W"
 }
 ff() { (cd "$T" && FF_ROOT="$SH" FF_WAIT_S=1 FF_WAIT_TRIES=2 FF_LOCK_WAIT_S=2 "$@" > "$T/ff.out" 2>&1); echo $?; }
+export FF_SETTLE_S=0   # the fixtures write their files moments before each run; F16 sets it again
+REALGIT=$(command -v git); mkdir -p "$T/gitwrap"
+cat > "$T/gitwrap/git" <<EOF
+#!/bin/bash
+# test-only git: the first call that writes files from an index (checkout-index) first runs \$FF_INJECT once, in the checkout:
+# a writer at work after the tool's check and before it writes, as in the review's reproduction
+case " \$* " in *" checkout-index "*) if [ -n "\${FF_INJECT:-}" ] && [ ! -e "$T/injected" ]; then : > "$T/injected"; (cd "\$FF_ROOT" && bash -c "\$FF_INJECT"); fi;; esac
+exec "$REALGIT" "\$@"
+EOF
+chmod +x "$T/gitwrap/git"
+ffw() { rm -f "$T/injected"; local inj="$1"; shift; (cd "$T" && PATH="$T/gitwrap:$PATH" FF_INJECT="$inj" FF_ROOT="$SH" FF_WAIT_S=1 FF_WAIT_TRIES=2 FF_LOCK_WAIT_S=2 "$@" > "$T/ff.out" 2>&1); echo $?; }
 head_is_origin() { [ "$(git -C "$SH" rev-parse HEAD)" = "$(git -C "$W/origin.git" rev-parse main)" ]; }
 clean_status() { [ -z "$(git -C "$SH" status --porcelain --untracked-files=all)" ]; }
 outside_applied() {
@@ -95,6 +106,44 @@ check "lock held: exit 4, main and files unchanged" '[ "$RC" = 4 ] && [ "$(git -
 echo "F10. a lane's staged work on a path origin does not change survives the fast-forward"
 mk; printf 'x9\n' > "$SH/lane/x.txt"; git -C "$SH" add lane/x.txt; RC=$(ff python3 "$FF")
 check "exit 0, level; lane/x.txt still staged with its content" '[ "$RC" = 0 ] && head_is_origin && outside_applied && [ "$(git -C "$SH" status --porcelain --untracked-files=all)" = "M  lane/x.txt" ] && [ "$(git -C "$SH" show :lane/x.txt)" = x9 ]'
+
+echo "F11. the review's race: a writer changes a file origin changes, after the check and before the files are written"
+mk; B=$(git -C "$SH" rev-parse HEAD); RC=$(ffw 'printf "agent work\n" > a.txt' python3 "$FF")
+check "exit 11, the path named, main unchanged" '[ "$RC" = 11 ] && grep -q "changed during the run, after the check: a.txt" "$T/ff.out" && [ "$(git -C "$SH" rev-parse HEAD)" = "$B" ]'
+check "the writer's edit is in place, and git shows it as the lane's edit" '[ "$(cat "$SH/a.txt")" = "agent work" ] && [ "$(git -C "$SH" status --porcelain -- a.txt)" = " M a.txt" ]'
+
+echo "F12. the same race on a file origin deletes: the edit survives; a rerun refuses until the lane settles it"
+mk; B=$(git -C "$SH" rev-parse HEAD); RC=$(ffw 'printf "agent b\n" > dir/b.txt' python3 "$FF")
+check "exit 11, dir/b.txt kept with the edit, main unchanged" '[ "$RC" = 11 ] && [ "$(cat "$SH/dir/b.txt")" = "agent b" ] && [ "$(git -C "$SH" rev-parse HEAD)" = "$B" ] && grep -q "changed during the run, after the check: dir/b.txt" "$T/ff.out"'
+RC=$(ff python3 "$FF")
+check "a rerun: exit 5, edited locally: dir/b.txt, the edit still there" '[ "$RC" = 5 ] && grep -q "edited locally: dir/b.txt" "$T/ff.out" && [ "$(cat "$SH/dir/b.txt")" = "agent b" ]'
+
+echo "F13. the same race on a file origin adds: the file the writer created is left as it is"
+mk; RC=$(ffw 'printf "agent u\n" > ü.txt' python3 "$FF")
+check "exit 11, ü.txt holds the writer's content, the path named" '[ "$RC" = 11 ] && [ "$(cat "$SH/ü.txt")" = "agent u" ] && grep -q "a file appeared during the run: ü.txt" "$T/ff.out"'
+
+echo "F14. a writer recreates a file between its move aside and the new version: the writer's file is left, main's kept"
+mk; RC=$(ff env FF_TEST_AFTER_ASIDE='printf "agent new\n" > a.txt' python3 "$FF")
+check "exit 11, a.txt holds the writer's file, main's version kept in the backup" '[ "$RC" = 11 ] && [ "$(cat "$SH/a.txt")" = "agent new" ] && grep -q "a file appeared during the run: a.txt" "$T/ff.out" && [ "$(cat "$SH"/.git/ffscoped-backup/*/files/a.txt)" = a1 ]'
+
+echo "F15. a write into the moved-aside file (as through a handle its writer had open) stops the round and is kept"
+mk; B=$(git -C "$SH" rev-parse HEAD); RC=$(ff env FF_TEST_AFTER_ASIDE='printf "late\n" >> "$FF_ASIDE"' python3 "$FF")
+check "exit 11, named, main unchanged, the late write in the backup" '[ "$RC" = 11 ] && grep -q "written after it was moved aside" "$T/ff.out" && [ "$(git -C "$SH" rev-parse HEAD)" = "$B" ] && grep -q late "$SH"/.git/ffscoped-backup/*/files/a.txt'
+
+echo "F16. a file to be replaced was written moments ago: refused before anything is written"
+mk; B=$(git -C "$SH" rev-parse HEAD); RC=$(ff env FF_SETTLE_S=300 python3 "$FF")
+check "exit 5, the pause advice with the path, main and files unchanged" '[ "$RC" = 5 ] && grep -q "pause it, then run again): a.txt" "$T/ff.out" && [ "$(git -C "$SH" rev-parse HEAD)" = "$B" ] && [ "$(cat "$SH/a.txt")" = a1 ] && [ ! -e "$SH/ü.txt" ]'
+
+echo "F17. the dry run lists every path it would write, remove or set in the index"
+mk; RC=$(ff python3 "$FF" --dry-run)
+check "exit 0; a.txt, dir/b.txt and ü.txt listed with what would happen to them" '[ "$RC" = 0 ] && grep -q "^  write  a.txt$" "$T/ff.out" && grep -q "^  remove dir/b.txt$" "$T/ff.out" && grep -q "^  write  ü.txt$" "$T/ff.out"'
+
+echo "F18. backups: main's versions kept after a run; an old unchanged backup removed later, an old changed one kept and named"
+mk; RC=$(ff python3 "$FF"); BK=$(ls -d "$SH"/.git/ffscoped-backup/*/ 2>/dev/null | head -1); BK=${BK%/}
+check "after a clean run, main's versions of the replaced and removed files are in the run's backup, and nothing is left behind" '[ "$RC" = 0 ] && [ -n "$BK" ] && [ "$(cat "$BK/files/a.txt")" = a1 ] && [ "$(cat "$BK/files/dir/b.txt")" = b1 ] && [ -z "$(ls -d "$SH"/.git/ffscoped-stage-* "$SH"/.git/ffscoped-index-* 2>/dev/null)" ] && [ -z "$(find "$SH" -name ".ffscoped-*" -not -path "*/.git/*")" ]'
+O1="$SH/.git/ffscoped-backup/20000101T000000Z-1-1"; O2="$SH/.git/ffscoped-backup/20000101T000000Z-2-1"
+cp -r "$BK" "$O1" 2>/dev/null; cp -r "$BK" "$O2" 2>/dev/null && printf 'late\n' >> "$O2/files/a.txt"; RC=$(ff python3 "$FF")
+check "the next run (nothing to do): the old unchanged backup removed, the old changed one kept and named, the recent one kept" '[ "$RC" = 0 ] && [ ! -e "$O1" ] && [ -e "$O2" ] && grep -q "kept: a file in it differs" "$T/ff.out" && [ -d "$BK" ]'
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ]

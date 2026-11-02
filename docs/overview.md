@@ -14,11 +14,11 @@ Ganymede is a set of small tools and a way of working for running many AI agents
 
 **Site file.** `slurm/site.<name>.env`: the account, partition, node shape, time limits and the fleet's limits for one cluster. See [configuration.md](configuration.md).
 
-**Caps.** `caps.json`: one GPU-hour cap per lane tag. The caps usually sum to the allocation; a `pool` entry can hold unassigned hours. See [budget-and-accounting.md](budget-and-accounting.md).
+**Caps.** `caps.json`: one GPU-hour cap per lane tag, required: no caps file, no submission. The caps usually sum to the allocation; a `pool` entry can hold unassigned hours. See [budget-and-accounting.md](budget-and-accounting.md).
 
 **Worst case.** What a submission can cost at most: its time limit times the GPUs it holds, times the array tasks and nodes. The budget check and the review hold both use it.
 
-**Fleet ceiling.** The most nodes the account may have in flight at once (`MAX_NODES_IN_FLIGHT`). Slurm may not enforce a node limit on a project account; the wrapper does.
+**Fleet ceiling.** The most nodes the account may have in flight at once (`MAX_NODES_IN_FLIGHT`). Slurm may not enforce a node limit on a project account; the wrapper does. A pending array counts the elements its throttle lets run at once.
 
 **Fleet queue.** When the ceiling is reached, a new job is accepted and submitted *held*, written to the queue file, and released first in first out when a node frees. Nobody has to resubmit.
 

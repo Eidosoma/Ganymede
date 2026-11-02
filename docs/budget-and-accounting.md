@@ -10,7 +10,7 @@ A fleet of agents spends a shared allocation. Ganymede keeps the spending per la
 {"alpha": 1200, "beta": 800, "gamma": 500, "infra": 100, "pool": 400}
 ```
 
-One entry per lane tag, in GPU-hours. A job's lane is the part of its name before the first `-`. A job whose tag has no cap is refused, so a misnamed job cannot run uncapped. The caps usually sum to the allocation; a `pool` entry holds hours not yet assigned. Moving hours between lanes is an edit to this file, and a decision the principal makes ([operating-model.md](operating-model.md#budget)).
+One entry per lane tag, in GPU-hours. A job's lane is the part of its name before the first `-`. A job whose tag has no cap is refused, so a misnamed job cannot run uncapped. The file itself is required: while `caps.json` is missing, unreadable or empty every submission is refused, and a cap that is not a finite, non-negative number refuses its lane's (exit 3, before accounting is read). `--over-cap-ok` skips the check, deliberately. The table works without the file. The caps usually sum to the allocation; a `pool` entry holds hours not yet assigned. Moving hours between lanes is an edit to this file, and a decision the principal makes ([operating-model.md](operating-model.md#budget)).
 
 ## The budget check
 
@@ -27,10 +27,10 @@ beta        412.10       0.00     800   387.900  0/0
 ```
 
 - **used**: GPU-hours from `sacct` since `BUDGET_SINCE`, for the site's `ACCOUNT` only: each job's GPUs times its elapsed time. GPUs come from `AllocTRES` (`gres/gpu=N`); on whole-node sites (`CHARGE_WHOLE_NODES=1`) a job with no GPU entry is charged its nodes times `GPUS_PER_NODE`.
-- **committed**: from `squeue`: a running job's remaining time, a pending job's full time limit, times its GPUs.
+- **committed**: from `squeue` over the whole account, one line per array task: a running job's remaining time, a pending job's full time limit, times its GPUs; plus the reservations of accepted jobs that neither the queue nor accounting shows yet (`reserved` in `--json`). The node ceiling counts the same array differently, by the elements its throttle lets run at once (see [submit and queue](submit-and-queue.md)).
 - **headroom**: cap minus used minus committed.
 
-`submit.sh` calls the check with the job's worst case before every submission. If `sacct` or `squeue` fails or exits non-zero, the check refuses (exit 3) rather than read the silence as "nothing used".
+`submit.sh` calls the check with the job's worst case inside the fleet lock, before every submission, and reserves each accepted job's worst case until the queue or accounting shows it. If `sacct` or `squeue` fails or exits non-zero, the check refuses (exit 3) rather than read the silence as "nothing used".
 
 **Light on the scheduler.** Every submission runs this check, so it has to be cheap for the accounting database that every user of the machine shares:
 
