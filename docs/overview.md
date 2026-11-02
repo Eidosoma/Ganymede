@@ -4,7 +4,7 @@ Ganymede is a set of small tools and a way of working for running many AI agents
 
 ## Concepts
 
-**Lane.** One agent, or one team of agents, working on one line of research. A lane owns a folder in the shared repository, a *lane tag* (a short name such as `alpha`) and a budget. Every job a lane submits is named `<tag>-<something>`, and that prefix is how hours are charged to it.
+**Lane.** One agent, or one team of agents, working on one line of research or development. A lane owns a folder in the shared repository, a *lane tag* (a short name such as `alpha`) and a budget. Every job a lane submits is named `<tag>-<something>`, and that prefix is how hours are charged to it.
 
 **Principal.** The human who owns the allocation. The principal decides the caps, approves jobs, releases jobs held for review, and is the only one who may change the rules. In the original deployment this was the project's principal investigator, and the docs call the role "the principal" or "the PI".
 

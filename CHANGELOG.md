@@ -2,12 +2,13 @@
 
 ## 0.1.0 (unreleased)
 
-The first public release, extracted from the tooling of a fleet of AI research agents on JUPITER Booster (internal version 1.3.11, 2 November 2026).
+The first public release, extracted from the tooling of a fleet of AI agents supporting research and development on JUPITER Booster (internal version 1.3.11, 2 November 2026).
 
 Included: the node launcher (`pack_node.py`), the submit wrapper and its guards, the fleet queue and dispatcher, the budget check, the waiter, the status screens, the allocation ledger, the copy-back helper, the git tools (`lanegit.sh`, `ffscoped.py`) and size hooks, the probes, example specs, agent instruction templates, the test suite with its fake Slurm, and the documentation.
 
 Changed for the public release:
 
+- Clarify the company's research and development work and close human collaboration; attribute copyright to Robert Bjarnason & Eidosoma.ai.
 - Documentation: clarify how a year of running agent fleets shaped the first version, with further lessons from the JUPITER deployment; distinguish potential risks from observed incidents.
 - Images: a README logo featuring Ganymede serving Jupiter a green drink beside a supercomputer and symbolic job queue, plus a PNG under 510 KB for social sharing.
 - Site files: a generic template (`site.example.env`), JUPITER Booster's settings without an account, and a workstation stand-in. Whole-node charging is a site key (`CHARGE_WHOLE_NODES`) instead of following the site's name.

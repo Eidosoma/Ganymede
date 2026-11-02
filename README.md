@@ -6,13 +6,13 @@
 
 In myth, Ganymede was Jupiter's cupbearer. Slurm is named after a drink. A royal cupbearer's real job was to check what went into the king's cup before the king drank it. Ganymede does that for a supercomputer: every job an agent pours is checked against its budget, the fleet's node ceiling and a human's sign-off before it reaches the machine. Afterwards, a receipt shows what each GPU actually did.
 
-Ganymede was built for a fleet of AI research agents on **JUPITER**, Europe's first exascale system at the Jülich Supercomputing Centre (JSC), and has run there since September 2026. Everything runs in user space on an ordinary project account: no admin rights, no daemon, no database. Slurm stays the scheduler; Ganymede is the one door to it.
+Ganymede was built for a fleet of AI agents supporting our company's research and development on **JUPITER**, Europe's first exascale system at the Jülich Supercomputing Centre (JSC), and has run there since September 2026. Everything runs in user space on an ordinary project account: no admin rights, no daemon, no database. Slurm stays the scheduler; Ganymede is the one door to it.
 
 ## Why
 
 Ganymede grew out of a year of running agent fleets. That experience helped us anticipate many of the risks of sharing budgets, compute and a working tree, and we built the first version to address them from the outset.
 
-In September 2026 we gave a dozen AI research agents one GPU allocation on JUPITER and one human to answer to. Each agent ran its own line of research as a long-running session on the machine's login nodes: it designed experiments, wrote the code, asked for the jobs, read the results and wrote them up. Fleets of agents like this are new. Nobody has a settled playbook for running them yet, us included, and we learned as we went. The first weeks on JUPITER put those safeguards to the test. Further issues and near misses led us to strengthen existing guards and add new ones ([lessons learned](docs/lessons-learned.md)).
+In September 2026 we gave a dozen AI agents one GPU allocation on JUPITER and one human to answer to. Each agent ran its own line of research and development as a long-running session on the machine's login nodes. Working in close collaboration with our human team, the agents designed experiments, wrote the code, asked for the jobs, read the results and wrote them up. Fleets of agents like this are new. Nobody has a settled playbook for running them yet, us included, and we learned as we went. The first weeks on JUPITER put those safeguards to the test. Further issues and near misses led us to strengthen existing guards and add new ones ([lessons learned](docs/lessons-learned.md)).
 
 What can go wrong when many agents share one allocation:
 
@@ -135,6 +135,8 @@ docs/                     the documentation
 Version 0.1.0, extracted from a production deployment. The interfaces are command lines, a JSON spec, a site file and the receipt format; expect them to change before 1.0. Contributions are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Licence
+
+Copyright 2026 Robert Bjarnason & Eidosoma.ai.
 
 Apache License 2.0; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
