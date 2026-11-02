@@ -1,0 +1,5 @@
+#!/bin/bash
+echo "$*" >> "$FAKE/sacct_calls.txt"
+[ -e "$FAKE/sacct_fail" ] && exit 1
+[ -f "$FAKE/sacct.txt" ] && cat "$FAKE/sacct.txt"
+exit 0

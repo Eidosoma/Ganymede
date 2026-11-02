@@ -1,0 +1,13 @@
+{
+ "job": "beta-sweep-node0",
+ "_note": "Filling a node's spare cores: four GPU tasks hold 8 cores each on their own CPU (site default --gpu-cores 8 --numa); the pool takes the rest. cmd_file has one shell command per line; 'parallel' workers, each pinned to 'threads' cores, run the lines in stride order at nice 10; every command's exit code and seconds are logged, and a failed command fails the node's all_ok. Keep pool outputs on scratch.",
+ "gpu_tasks": [
+  {"name": "trainer-0", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 0 --resume"},
+  {"name": "trainer-1", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 1 --resume"},
+  {"name": "trainer-2", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 2 --resume"},
+  {"name": "trainer-3", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 3 --resume"}
+ ],
+ "cpu_pools": [
+  {"name": "planners", "cwd": "/path/to/your/project", "cmd_file": "jobs/planner_sweep.txt", "threads": 1, "parallel": 240, "mem_gb": 1.5}
+ ]
+}

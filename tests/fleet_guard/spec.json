@@ -1,0 +1,1 @@
+{"job": "alpha-test-v1", "gpu_tasks": [{"name": "g0", "cmd": "true"}], "cpu_tasks": []}

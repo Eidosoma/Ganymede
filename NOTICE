@@ -1,0 +1,8 @@
+Ganymede
+Copyright 2026 The Ganymede Authors
+
+This product was developed for, and first deployed on, the JUPITER supercomputer at the Jülich Supercomputing Centre.
+
+Optional dependency, not included in this repository:
+  nvidia-ml-py (module pynvml), Python bindings for the NVIDIA Management Library, Copyright NVIDIA Corporation,
+  distributed under the BSD 3-Clause licence: https://pypi.org/project/nvidia-ml-py/

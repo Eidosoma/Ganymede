@@ -1,0 +1,3 @@
+# Ganymede's tools use the Python standard library only. Optional:
+nvidia-ml-py      # NVML bindings: the Hopper GPM counters (active SMs, tensor activity) in every receipt; without it the launcher samples nvidia-smi
+# torch           # only for probes/ (smoke test, GPU-metrics calibration, multi-node NCCL test)

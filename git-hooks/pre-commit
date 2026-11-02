@@ -1,0 +1,16 @@
+#!/bin/bash
+# Fleet size guard: refuse a commit that adds or changes a file above the limit, so nobody has to
+# inspect a push for large outputs. Outputs belong under $FLEET_RUNS (scratch) or $FLEET_KEEP (project), never in git.
+# Limit: FLEET_MAX_FILE_MB (default 10). Deliberate exception, once: FLEET_ALLOW_LARGE=1 git commit ...
+LIMIT_MB=${FLEET_MAX_FILE_MB:-10}; LIMIT=$((LIMIT_MB*1024*1024))
+[ "${FLEET_ALLOW_LARGE:-0}" = 1 ] && exit 0
+bad=0
+while IFS= read -r -d '' path; do
+  size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$LIMIT" ]; then printf 'refused: %s is %d MB (limit %d MB)\n' "$path" $((size/1024/1024)) "$LIMIT_MB" >&2; bad=1; fi
+done < <(git diff --cached --name-only --diff-filter=AM -z)
+if [ $bad != 0 ]; then
+  echo "Fleet pre-commit hook: large files refused. Keep outputs outside git (\$FLEET_RUNS or \$FLEET_KEEP); commit receipts, packets, protocols, scripts and tests only. A deliberate exception: FLEET_ALLOW_LARGE=1 git commit ..." >&2
+  exit 1
+fi
+exit 0

@@ -1,0 +1,94 @@
+# Submitting and the fleet queue
+
+`slurm/submit.sh` is the only way a fleet job reaches Slurm. It turns a spec into one `sbatch` call with the right account, partition, node shape and checkpoint warning, after a set of guards. `slurm/fleet_dispatch.sh` releases jobs the wrapper had to queue.
+
+## Usage
+
+```
+slurm/submit.sh [--site NAME] [--devel] [--time HH:MM:SS] [--name NAME] [--pack "extra pack_node args"]
+                [--array 0-N%M --spec-dir DIR] [--nodes N] [--after ID[:ID..]] [--afterany ID[:ID..]]
+                [--cpu-only [--cores N]] [--force-node --reason "..."] [--low] [--hold] [--over-cap-ok]
+                [--comment "KEY=VALUE;KEY=VALUE"] [--allow-same-name] SPEC
+```
+
+| option | meaning |
+|---|---|
+| `--site NAME` | read `slurm/site.NAME.env` (default `local`) |
+| `--devel` | the development partition and `DEVEL_MAX_TIME` |
+| `--time` | the wall-time limit (default `MAX_TIME`) |
+| `--name` | the job name (default: the spec's `job`); it must start with a lane tag that has a cap |
+| `--pack` | extra arguments for `pack_node.py`, after the site's `PACK_EXTRA` |
+| `--array 0-N%M --spec-dir DIR` | an array: task *i* runs `DIR/node_i.json`; the throttle `%M` is required |
+| `--nodes N` | a multi-node job: the same spec on N whole nodes, one launcher per node ([multi-node.md](multi-node.md)) |
+| `--after` / `--afterany` | chain behind earlier jobs (`afterok` / `afterany`); an `afterok` chain that can never start is cancelled |
+| `--cpu-only [--cores N]` | a spec without GPU tasks, on the site's `CPU_PARTITION` |
+| `--force-node --reason` | a CPU-only spec holding a whole GPU node (charged as such), with a written reason |
+| `--low` | filler priority (`sbatch --nice=1000`) |
+| `--hold` | submit held; release with `scontrol release ID` |
+| `--over-cap-ok` | skip the budget check (a deliberate, recorded exception) |
+| `--comment` | passed to `sbatch --comment`: site job overrides such as JSC's `CUDA_MPS=1`; commas and quotes are refused |
+| `--allow-same-name` | allow a second job under a name that is already pending or running (the next segment of a run) |
+
+The job id goes to stdout; everything else goes to stderr. Give the wrapper a time limit you have priced ([operating-model.md](operating-model.md#pricing-a-job)).
+
+## The guards
+
+They run in this order. Every one fails closed: if the queue or the accounting cannot be read, nothing is submitted.
+
+1. **Spec checks.** The spec must exist; a spec without GPU tasks needs `--cpu-only` (and a site with a CPU partition) or `--force-node --reason`; an array needs a positive throttle.
+2. **Budget.** The worst case is the time limit times `GPUS_PER_NODE`, times the array tasks and nodes (0 for `--cpu-only`). `budget.py` refuses if the lane's used plus committed plus this job would exceed its cap, if the lane tag has no cap, or if accounting cannot be read. Exit 3.
+3. **Review hold.** A worst case above `REVIEW_THRESHOLD_HOURS` is submitted held, with the message `HELD FOR REVIEW`. A reviewer checks it against the lane's plan and the principal releases it (`scontrol release ID`) or cancels it. The dispatcher never releases such a job.
+4. **Fleet lock.** One submission at a time across the fleet: an atomic `mkdir` of `FLEET_LOCK_DIR` on the shared file system. A lock older than three minutes is taken over (its holder died). If the lock stays busy for `FLEET_LOCK_WAIT` seconds (45), exit 4.
+5. **Queue first.** Before looking at this job, the dispatcher releases any queued jobs that now fit, so earlier jobs go first.
+6. **One snapshot.** `squeue` is read once; if that fails, exit 4. All the following guards use that snapshot.
+7. **Duplicate name.** A job of the same name already pending or running: exit 5, unless `--allow-same-name`. If the existing job is held, it is waiting for a node or for review, and must not be resubmitted.
+8. **Rate.** `MAX_SUBMITS_PER_10MIN` or more submissions from the account in the last ten minutes: exit 6. A loop is submitting, or it is a busy moment; either way, wait.
+9. **Ceiling.** The nodes this job uses at once (nodes times the array throttle) may never exceed `MAX_NODES_IN_FLIGHT`, held or not (exit 4). If the account's nodes in flight plus this job exceed the ceiling, or others are already waiting, the job is **accepted and held** and appended to the fleet queue.
+
+Then exactly one `sbatch` call, with `--no-requeue` (a node failure never restarts a job by itself) and one combined `--dependency` when chaining.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | submitted, or accepted and queued (the message says `QUEUED BY THE FLEET GUARD` and gives the position) |
+| 1 | usage error or a missing spec |
+| 2 | refused spec or options (no GPU tasks, array without a throttle, bad `--comment`) |
+| 3 | refused by the budget check |
+| 4 | the ceiling would be exceeded even alone, the fleet lock stayed busy, or the queue could not be read |
+| 5 | a job of that name is already pending or running |
+| 6 | the rate guard |
+| other | `sbatch` itself failed; nothing was queued and the lock was released |
+
+None of these is a reason to retry automatically. Read the message, and take a refusal back to the human who approved the job.
+
+## The fleet queue
+
+When the ceiling is reached, the wrapper submits the job held and appends a line to `FLEET_QUEUE_FILE`:
+
+```
+2026-11-03T09:14:40Z|1234567|alpha-density-training|1
+time UTC            |job id |name                  |nodes at once
+```
+
+`slurm/fleet_dispatch.sh` releases queued jobs first in first out, as far as they fit under the ceiling. It runs:
+
+- at the end of every fleet job, from `node.sbatch`, with `--departing JOBID` so the leaving job is not counted while its chained successors are;
+- at the start of every submission;
+- by hand, at any time: `bash slurm/fleet_dispatch.sh --site mysite`.
+
+It is idempotent. It only ever releases jobs that are in the queue file and still pending with a user hold; it never submits, never cancels, and never touches a job held for review or held by a lane. If the job at the head does not fit, nothing behind it is released (strict first in first out, so a two-node job is not starved by one-node jobs). Lines for jobs that are no longer held are pruned, but only after a successful reading of the queue. Each release is logged in `FLEET_DISPATCH_LOG`.
+
+**Nodes in flight** are: running and configuring jobs, plus pending jobs that are free to start (no dependency, not held). Held and chained jobs are not counted until they can start.
+
+**Several copies of the tooling.** If lanes pin their own copy, set `FLEET_QUEUE_FILE`, `FLEET_LOCK_DIR` and `FLEET_DISPATCH_LOG` to absolute paths on the shared file system in every copy's site file, so all copies queue and release from one list.
+
+## What the batch script does
+
+`slurm/node.sbatch` runs in the tooling folder. It evaluates `ENV_ACTIVATE`, writes a `START` line to `receipts/JOBS.log`, and starts `pack_node.py` in the background with `--receipt-dir receipts/<name>-<jobid>`. Slurm's checkpoint warning (`--signal=B:USR1@SIGNAL_BEFORE_END`) reaches only the batch shell, so the shell traps `USR1` and `TERM` and forwards them to the launcher, then keeps waiting until the launcher has really exited. Without that trap, bash dies of the signal and Slurm tears the job down before any task can checkpoint. At the end it writes `DONE`, `FAILED` or `REFUSED` to the job log and runs the dispatcher (best effort, 90 seconds at most).
+
+Slurm's own output goes to `logs/<name>-<jobid>.out` and `.err`; the launcher's watchdog line, if any, is there too.
+
+## Multi-node jobs
+
+`--nodes N` runs the same spec on N whole nodes under `srun`, one launcher per node, receipts in `receipts/<name>-<jobid>/node-<k>/`. The tasks see `SLURM_NNODES`, `SLURM_NODEID` and `SLURM_JOB_NODELIST`. See [multi-node.md](multi-node.md) for the qualified NCCL recipe.

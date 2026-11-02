@@ -1,0 +1,13 @@
+{
+ "job": "alpha-train-node0",
+ "_note": "One packed node: four GPU tasks (one per GPU; the launcher refuses a spec that leaves a GPU idle) and one CPU sidecar. Each task checkpoints on SIGUSR1 and resumes with --resume. Submit: slurm/submit.sh --site mysite --time 02:00:00 examples/specs/basic-node.json",
+ "gpu_tasks": [
+  {"name": "seed-0", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 0 --resume"},
+  {"name": "seed-1", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 1 --resume"},
+  {"name": "seed-2", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 2 --resume"},
+  {"name": "seed-3", "cwd": "/path/to/your/project", "threads": 8, "cmd": "python train.py --seed 3 --resume"}
+ ],
+ "cpu_tasks": [
+  {"name": "evaluator", "cwd": "/path/to/your/project", "threads": 4, "mem_gb": 8, "cmd": "python evaluate.py --follow runs/ --until-done"}
+ ]
+}

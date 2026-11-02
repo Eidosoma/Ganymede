@@ -1,0 +1,13 @@
+{
+ "job": "infra-smoke-node",
+ "_note": "The first job on a new machine: one smoke probe per GPU (imports, one visible device, the launcher's core pinning, FP32/BF16 matmul) and a 48-command numpy pool on the spare cores. Proves submit, packing, pinning, signals, receipts and the job log. Replace /path/to/ganymede and the module names. Submit: slurm/submit.sh --site mysite --devel examples/specs/smoke-node.json",
+ "gpu_tasks": [
+  {"name": "probe-0", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/smoke_task.py --import numpy"},
+  {"name": "probe-1", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/smoke_task.py --import numpy"},
+  {"name": "probe-2", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/smoke_task.py --import numpy"},
+  {"name": "probe-3", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/smoke_task.py --import numpy"}
+ ],
+ "cpu_pools": [
+  {"name": "numpy-pool", "cwd": "/path/to/ganymede", "cmd_file": "examples/specs/pool_cmds.txt", "threads": 1, "parallel": 32, "mem_gb": 4}
+ ]
+}

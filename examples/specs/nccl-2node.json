@@ -1,0 +1,11 @@
+{
+ "job": "infra-nccl-2node-v1",
+ "_note": "Qualifies the multi-node path (docs/multi-node.md). Submit with: slurm/submit.sh --site mysite --nodes 2 --time 00:20:00 examples/specs/nccl-2node.json. The same spec runs on every node, one launcher per node, one task per GPU; rank = SLURM_NODEID x 4 + local rank. NCCL_SOCKET_IFNAME names the bootstrap interface (ib0 on JUPITER); NCCL then uses InfiniBand natively. Replace /path/to/ganymede.",
+ "gpu_tasks": [
+  {"name": "rank-l0", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "NCCL_SOCKET_IFNAME=ib0 GLOO_SOCKET_IFNAME=ib0 python probes/nccl_test.py --local-rank 0 --minutes 12"},
+  {"name": "rank-l1", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "NCCL_SOCKET_IFNAME=ib0 GLOO_SOCKET_IFNAME=ib0 python probes/nccl_test.py --local-rank 1 --minutes 12"},
+  {"name": "rank-l2", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "NCCL_SOCKET_IFNAME=ib0 GLOO_SOCKET_IFNAME=ib0 python probes/nccl_test.py --local-rank 2 --minutes 12"},
+  {"name": "rank-l3", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "NCCL_SOCKET_IFNAME=ib0 GLOO_SOCKET_IFNAME=ib0 python probes/nccl_test.py --local-rank 3 --minutes 12"}
+ ],
+ "cpu_tasks": []
+}

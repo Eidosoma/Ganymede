@@ -1,0 +1,20 @@
+{
+ "job_name": "alpha-density-training",
+ "line": "alpha-density-training: one node, four GPUs, --time 02:30:00, worst case 10.00 GPU-hours, about 7.5 expected, once",
+ "authorised_by": {
+  "word": "lets go",
+  "first_observed_utc": "2026-11-03T09:14:07Z",
+  "observed_how": "date -u at the lane's first command after the principal's message",
+  "covers": "this one job only"
+ },
+ "checks_before_submit": {
+  "at_utc": "2026-11-03T09:14:21Z",
+  "controller": "scontrol ping: UP",
+  "accounting_by_name": "TZ=UTC sacct -X -A <account> -S 2026-11-01 --format=JobID,JobName%40,State -P -n: no job of this name",
+  "budget": "used 875.40 of cap 1200, committed 9.00: the worst case fits",
+  "frozen_code": {"spec": "sha256:3f9c2a71d04e8b56", "train.py": "sha256:a81d77c0e2f94b13"},
+  "fleet_queue": "readable; one job in flight"
+ },
+ "submitted": {"at_utc": "2026-11-03T09:14:40Z", "job_id": "1234567", "command": "slurm/submit.sh --site mysite --time 02:30:00 waves/density/spec.json"},
+ "retry_permission": null
+}

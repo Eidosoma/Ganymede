@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+logs/
+receipts/
+caps.json
+slurm/site.*.env
+!slurm/site.example.env
+!slurm/site.jupiter.env
+!slurm/site.local.env
+ALLOCATION_LEDGER.md

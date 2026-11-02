@@ -1,0 +1,13 @@
+#!/bin/bash
+# fake squeue over $FAKE/jobs.txt: A|F|D|t|E|r|V|j|l|M  (unique id|base id|nodes|state|dependency|reason|submit|name|limit|elapsed)
+[ -e "$FAKE/squeue_fail" ] && { echo "slurm_load_jobs error: Socket timed out" >&2; exit 1; }
+FMT='%i'; STATES='PD,R,CF,CG'; IDS=''
+while [ $# -gt 0 ]; do case "$1" in -o) FMT="$2"; shift 2;; -t) STATES="$2"; shift 2;; -j) IDS="$2"; shift 2;; -A|-u|-n) shift 2;; *) shift;; esac; done
+[ -f "$FAKE/jobs.txt" ] || exit 0
+while IFS='|' read -r A F D t E r V j l M; do
+  [ -n "$A" ] || continue
+  if [ "$STATES" != all ]; then case ",$STATES," in *",$t,"*) ;; *) continue;; esac; fi
+  if [ -n "$IDS" ]; then case ",$IDS," in *",$F,"*|*",$A,"*) ;; *) continue;; esac; fi
+  out="$FMT"; out="${out//%A/$A}"; out="${out//%F/$F}"; out="${out//%i/$A}"; out="${out//%D/$D}"; out="${out//%t/$t}"; out="${out//%E/$E}"; out="${out//%r/$r}"; out="${out//%V/$V}"; out="${out//%j/$j}"; out="${out//%l/$l}"; out="${out//%M/$M}"; out="${out//%b/gres/gpu:4}"
+  echo "$out"
+done < "$FAKE/jobs.txt"

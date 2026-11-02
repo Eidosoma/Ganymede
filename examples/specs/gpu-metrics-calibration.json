@@ -1,0 +1,11 @@
+{
+ "job": "infra-gpu-metrics-v1",
+ "_note": "Calibrates the GPU activity numbers in every receipt against a known truth: four GPUs driven at registered duty cycles 1.0, 0.5, 0.25 and 0.0 for 120 s, with GPM counters and nvidia-smi sampled every second. On GH200 the receipt's gpu_util read 90.8 / 49.1 / 29.3 / 0.0 and sm_active 86.6 / 44.6 / 24.9 / 0.0: linear, no cross-talk onto the idle card. Replace /path/to/ganymede.",
+ "gpu_tasks": [
+  {"name": "duty-100", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/gpu_load_probe.py --duty 1.0 --seconds 120"},
+  {"name": "duty-50", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/gpu_load_probe.py --duty 0.5 --seconds 120"},
+  {"name": "duty-25", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/gpu_load_probe.py --duty 0.25 --seconds 120"},
+  {"name": "duty-0", "cwd": "/path/to/ganymede", "threads": 8, "cmd": "python probes/gpm_sampler.py --seconds 122 --period 1 --out $PACK_RECEIPT_DIR/gpm-duty-0.jsonl"}
+ ],
+ "cpu_tasks": []
+}
