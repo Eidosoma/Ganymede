@@ -2,6 +2,8 @@
 """budget.py [--site NAME] [--lane TAG] [--est-hours H] [--json] [--no-cache]
 Per lane: GPU-hours used (accounting since BUDGET_SINCE), committed (running jobs' remaining time and pending jobs' full
 time limit, times their GPUs), cap (caps.json), headroom. With --lane and --est-hours: exit 3 if used+committed+est > cap.
+A queued job with no time limit (UNLIMITED, or a limit that cannot be read) has no worst case: its lane admits nothing more until
+it gets one (exit 3; it must never count as nothing).
 A submission (--lane) needs a valid caps.json with a finite, non-negative cap for its lane: otherwise exit 3, before accounting
 is read (a missing or empty file must never mean no limit). The table works without one.
 Accounting is read for the site's ACCOUNT only, in UTC windows of BUDGET_WINDOW_DAYS (7), each job once; finished windows are
@@ -14,14 +16,12 @@ def site_env(site):
         l=l.split('#')[0].strip()
         if '=' in l: k,v=l.split('=',1); d[k]=v.strip().strip('"').strip("'")
     return d
+sys.path.insert(0,HERE); import timelimit   # one reading of Slurm's time forms, shared with the submit wrapper
 def dur(s):
-    """Slurm duration D-HH:MM:SS | HH:MM:SS | MM:SS | UNLIMITED -> seconds"""
-    if not s or s in ('UNLIMITED','N/A','INVALID'): return 0
-    d=0
-    if '-' in s: d,s=s.split('-'); d=int(d)
-    p=[int(x) for x in s.split(':')]
-    while len(p)<3: p.insert(0,0)
-    return d*86400+p[0]*3600+p[1]*60+p[2]
+    """A Slurm duration as squeue prints it (M:SS, H:MM:SS, D-HH:MM:SS; any of Slurm's six forms) -> seconds; None for UNLIMITED,
+    NOT_SET, N/A, INVALID and anything else that is not a duration (counted as 0, a job with no limit would commit
+    nothing)."""
+    return timelimit.seconds((s or '').strip())
 def gpus_of(tres, nodes, per_node, charge_node, per_node_fmt=False):
     """GPUs of a job. sacct's AllocTRES is a job total and carries a typed and an untyped entry ('...,gres/gpu:gh200=8,gres/gpu=8,node=2');
     squeue's %b is per node ('gres/gpu:4'). The caller names the format: guessing it from the string let the typed entry in AllocTRES
@@ -143,12 +143,14 @@ def main():
             return None if none_on_failure else ''
         return r.stdout
     used,acct_jobs=used_by_lane(env,a.site,per_node,charge,since,lambda cmd: read(cmd,none_on_failure=True),a.no_cache)
-    com={}; counts={}; qids=set(); qcom={}
+    com={}; counts={}; qids=set(); qcom={}; unbounded={}
     acct=env.get('ACCOUNT','')   # the whole account's queue, one line per array task (-r): a pending array is counted task by task
     out=read(['squeue','-h','-r']+(['-A',acct] if acct else ['-u',os.environ.get('USER','')])+['-o','%i|%j|%t|%l|%M|%D|%b'])
     for l in out.strip().splitlines():
         jid,name,st,lim,el,nodes,tres=l.split('|')[:7]; lane=name.split('-')[0]; nodes=int(nodes or 1); qids.add(jid.split('_')[0])
-        g=gpus_of(tres,nodes,per_node,charge,per_node_fmt=True); rem=max(0,dur(lim)-(dur(el) if st=='R' else 0))
+        g=gpus_of(tres,nodes,per_node,charge,per_node_fmt=True); L=dur(lim)
+        if L is None: unbounded.setdefault(lane,[]).append(jid); L=0   # no limit, or one that cannot be read: no bound (refused below)
+        rem=max(0,L-((dur(el) or 0) if st=='R' else 0))
         qcom[jid.split('_')[0]]=qcom.get(jid.split('_')[0],0)+g*rem/3600; com[lane]=com.get(lane,0)+g*rem/3600; c=counts.setdefault(lane,{'R':0,'PD':0,'other':0}); c[st if st in ('R','PD') else 'other']+=1
     # Reservations: an accepted submission's worst case stays on file until accounting has reconciled the job, every one of its tasks
     # finished there. Until then the job counts as the larger of that worst case and what the queue and accounting already show for it:
@@ -178,7 +180,7 @@ def main():
         if inq: f[9]=nowts.strftime('%Y-%m-%dT%H:%M:%SZ')              # the queue shows it now
         elif base not in acct_base:
             t0=when(f[0]) or nowts; last=when(f[9])
-            if nowts>max(t0+dt.timedelta(seconds=dur(f[4])),last or t0)+dt.timedelta(days=1):
+            if nowts>max(t0+dt.timedelta(seconds=dur(f[4]) or 0),last or t0)+dt.timedelta(days=1):
                 print(f"BUDGET: reservation {f[1]} ({f[2]}, {f[3]} GPU-h) expired: neither the queue nor accounting shows the job, a day after its time limit"
                       +(" and a day after the queue last showed it" if last else ''),file=sys.stderr); continue
         keep.append('|'.join(f))
@@ -193,13 +195,17 @@ def main():
     lanes=sorted(set(used)|set(com)|set(caps)); rows=[]
     for lane in lanes:
         cap=caps.get(lane); u=round(used.get(lane,0),3); c=round(com.get(lane,0),3)
-        rows.append(dict(lane=lane,used=u,committed=c,reserved=round(res.get(lane,0),3),cap=cap,headroom=(round(cap-u-c,3) if cap is not None else None),queue=counts.get(lane,{'R':0,'PD':0,'other':0})))
+        rows.append(dict(lane=lane,used=u,committed=c,reserved=round(res.get(lane,0),3),cap=cap,headroom=(round(cap-u-c,3) if cap is not None else None),queue=counts.get(lane,{'R':0,'PD':0,'other':0}),unbounded_jobs=unbounded.get(lane,[])))
     if a.json: print(json.dumps(rows,indent=1))
     else:
         print(f"{'lane':8s} {'used':>9s} {'committed':>10s} {'cap':>7s} {'headroom':>9s}  R/PD")
         for r in rows: print(f"{r['lane']:8s} {r['used']:9.2f} {r['committed']:10.2f} {str(r['cap'] or '-'):>7s} {str(r['headroom'] if r['headroom'] is not None else '-'):>9s}  {r['queue']['R']}/{r['queue']['PD']}")
+    if a.lane is None:
+        for lane,j in sorted(unbounded.items()): print(f"BUDGET: lane {lane}: job(s) {' '.join(j[:5])} in the queue with no time limit (UNLIMITED, or one that cannot be read): no worst case, so the lane admits nothing more until they get one",file=sys.stderr)
     if a.lane is not None:
         cap=caps[a.lane]   # checked at the start: present, finite, non-negative
+        if a.lane in unbounded:
+            print(f"BUDGET: lane {a.lane} has job(s) {' '.join(unbounded[a.lane][:5])} in the queue with no time limit (UNLIMITED, or a limit that cannot be read): their worst case has no bound, so the lane admits nothing more; give them a limit (scontrol update JobId=ID TimeLimit=HH:MM:SS) or cancel them",file=sys.stderr); sys.exit(3)
         if used.get(a.lane,0)+com.get(a.lane,0)+a.est_hours>cap:
             print(f"BUDGET: lane {a.lane} would exceed its cap {cap}: used {used.get(a.lane,0):.2f} + committed {com.get(a.lane,0):.2f} + this job {a.est_hours:.2f}",file=sys.stderr); sys.exit(3)
 if __name__=='__main__': main()

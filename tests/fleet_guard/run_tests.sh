@@ -15,6 +15,7 @@ STAGE="$T/stage"; export FAKE="$T/state"; export PATH="$T/bin:$PATH"
 cp "$HERE/site.test.env" "$STAGE/slurm/site.test.env" && cp "$HERE/caps.test.json" "$STAGE/caps.json" || { echo "could not stage the test site file and caps"; exit 2; }
 export FLEET_QUEUE_FILE="$T/state/FLEET_QUEUE.log" FLEET_LOCK_DIR="$T/state/.fleet.lock" FLEET_DISPATCH_LOG="$T/dispatch.log" FLEET_LOCK_WAIT=3
 export FLEET_RESERVATIONS_FILE="$T/state/FLEET_RESERVATIONS.log"   # never the live file: the staged site file names the live one
+export FLEET_SUBMISSIONS_FILE="$T/state/FLEET_SUBMISSIONS.log"     # nor the live submission record (1.3.18)
 PASS=0; FAILS=0
 ok()   { PASS=$((PASS+1)); echo "  pass: $1"; }
 bad()  { FAILS=$((FAILS+1)); echo "  FAIL: $1"; }
@@ -108,6 +109,15 @@ reset; NOW=$(date +%FT%T); for i in $(seq 201 212); do job $i 1 CD "(null)" None
 check "12 submissions in the last ten minutes: exit 6, nothing sent" '[ $RC = 6 ] && [ ! -s "$FAKE/sbatch_calls.txt" ]'
 reset; for i in $(seq 201 212); do job $i 1 CD "(null)" None "2026-09-20T09:00:00" "beta-old-$i"; done; sub
 check "12 old submissions do not count" '[ $RC = 0 ]'
+reset; NOW=$(date -u +%FT%TZ); for i in $(seq 401 412); do echo "$NOW|$i|beta-gone-$i|beta|-|1|1|00:01:00|-" >> "$FLEET_SUBMISSIONS_FILE"; done; sub
+check "the review's case: 12 submissions in the last ten minutes that the queue no longer shows (ended, then forgotten after MinJobAge), in the fleet's own record: exit 6, nothing sent (1.3.17 accepted)" '[ $RC = 6 ] && [ ! -s "$FAKE/sbatch_calls.txt" ]'
+reset; OLD=$(date -u -d "-11 minutes" +%FT%TZ); for i in $(seq 401 412); do echo "$OLD|$i|beta-old-$i|beta|-|1|1|00:01:00|-" >> "$FLEET_SUBMISSIONS_FILE"; done; sub
+check "12 recorded eleven minutes ago do not count: accepted" '[ $RC = 0 ]'
+reset; NOW=$(date -u +%FT%TZ); NOWL=$(date +%FT%T); for i in $(seq 401 411); do echo "$NOW|$i|beta-both-$i|beta|-|1|1|00:01:00|-" >> "$FLEET_SUBMISSIONS_FILE"; job $i 1 CD "(null)" None "$NOWL" "beta-both-$i"; done; sub
+check "11 submissions that the queue and the record both show count once each: the 12th is accepted" '[ $RC = 0 ]'
+check "and it is in the record: time|job|name|lane|array|tasks|nodes|limit|dependency" 'grep -q "^20[0-9-]*T[0-9:]*Z|$OUT|alpha-test-v1|alpha|-|1|1|01:00:00|-$" "$FLEET_SUBMISSIONS_FILE"'
+reset; job 101; Q=$(bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 --array 0-3%2 --spec-dir "$T/specdir" --afterany 101 --name alpha-rec-arr-v1 "$T/spec.json" 2>/dev/null)
+check "an array chained behind 101 is recorded with its spec, its tasks and its dependency" 'grep -q "|$Q|alpha-rec-arr-v1|alpha|0-3%2|4|1|01:00:00|afterany:101$" "$FLEET_SUBMISSIONS_FILE"'
 
 echo "13. dependencies"
 reset; job 101; sub --after 101 --afterany 102
@@ -142,7 +152,8 @@ check "it polls every ten minutes by default and never faster than once a minute
 
 wj(){ OUTW=$(timeout "${2:-10}" python3 "$STAGE/slurm/wait_jobs.py" $1 --poll 1 --receipts "$T/rcpt" 2>&1); RCW=$?; }
 rcpt(){ mkdir -p "$T/rcpt/$1"; echo "{\"all_ok\": ${2:-true}, \"wall_s\": 5, \"gpu_slot_hours_held\": 0.01, \"tasks\": [], \"interrupted\": null}" > "$T/rcpt/$1/receipt.json"; }
-reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "700_0|arr-x-v1|COMPLETED|10|701|1" "700_1|arr-x-v1|COMPLETED|10|700|1" > "$FAKE/sacct.txt"; rcpt arr-x-v1-701-a0; rcpt arr-x-v1-700-a1; wj 700
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "700_0|arr-x-v1|COMPLETED|10|701|1" "700_1|arr-x-v1|COMPLETED|10|700|1" > "$FAKE/sacct.txt"; rcpt arr-x-v1-701-a0; rcpt arr-x-v1-700-a1
+echo "$(date -u +%FT%TZ)|700|arr-x-v1|arr|0-1%1|2|1|01:00:00|-" > "$FLEET_SUBMISSIONS_FILE"; wj 700   # the record the wrapper writes (1.3.18)
 check "an array that accounting lists as 700_0 and 700_1 (never 700): the wait ends, exit 0, each element's receipt found under its own job id" '[ $RCW = 0 ] && [ $(echo "$OUTW" | grep -c "all_ok=True") = 2 ] && echo "$OUTW" | grep -q "^job 700_1 arr-x-v1 COMPLETED"'
 printf '%s\n' "700_0|arr-x-v1|COMPLETED|10|701|1" "700_1|arr-x-v1|FAILED|10|700|1" > "$FAKE/sacct.txt"; wj 700
 check "one element failed: exit 1" '[ $RCW = 1 ]'
@@ -160,6 +171,19 @@ check "a later accounting read that fails and leaves out a failed job: the repor
 reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; printf '%s\n' "800|ok-x-v1|COMPLETED|10|800|1" > "$FAKE/sacct.txt"; touch "$FAKE/sacct_fail"; wj 800 6
 check "accounting failing: a failed read is no answer, it keeps waiting" '[ $RCW = 124 ]'
 rm -f "$FAKE/sacct_fail"
+reset; rm -rf "$T/rcpt"; : > "$FAKE/jobs.txt"; echo "$(date -u +%FT%TZ)|703|arr-y-v1|arr|0-1%1|2|1|01:00:00|-" > "$FLEET_SUBMISSIONS_FILE"
+echo "703_0|arr-y-v1|COMPLETED|10|704|1" > "$FAKE/sacct.txt"; rcpt arr-y-v1-704-a0; rcpt arr-y-v1-703-a1 false; wj 703 6
+check "the review's case: a two-element array that accounting shows only in part (703_0 completed; 703_1 not listed yet, its failed receipt already written): it keeps waiting (1.3.17 returned 0)" '[ $RCW = 124 ]'
+printf '%s\n' "703_0|arr-y-v1|COMPLETED|10|704|1" "703_1|arr-y-v1|FAILED|10|703|1" > "$FAKE/sacct.txt"; wj 703
+check "accounting lists both: the failed element reported, exit 1" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "^job 703_1 arr-y-v1 FAILED"'
+rcpt arr-y-v1-703-a1; printf '%s\n' "703_0|arr-y-v1|COMPLETED|10|704|1" "703_1|arr-y-v1|COMPLETED|10|703|1" > "$FAKE/sacct.txt"; wj 703
+check "both completed, both receipts all ok: exit 0" '[ $RCW = 0 ]'
+printf '%s\n' "703_0|arr-y-v1|COMPLETED|10|704|1" "703_[1]|arr-y-v1|CANCELLED|0|703|1" > "$FAKE/sacct.txt"; wj 703
+check "an element that never started, shown as a range: accounted for, reported, exit 1" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "703_\[1\] .*never started"'
+: > "$FLEET_SUBMISSIONS_FILE"; printf '%s\n' "703_0|arr-y-v1|COMPLETED|10|704|1" "703_1|arr-y-v1|COMPLETED|10|703|1" > "$FAKE/sacct.txt"; wj 703
+check "an array the record does not have: its element set cannot be verified, exit 1, and the message names --expect" '[ $RCW = 1 ] && echo "$OUTW" | grep -q "cannot be verified" && echo "$OUTW" | grep -q -- "--expect 703:SPEC"'
+OUTW=$(timeout 10 python3 "$STAGE/slurm/wait_jobs.py" 703 --poll 1 --receipts "$T/rcpt" --expect 703:0-1 2>&1); RCW=$?
+check "the same with --expect 703:0-1: verified, exit 0" '[ $RCW = 0 ]'
 
 echo "17. the queue file is pruned and the dispatcher stays quiet when nobody waits"
 reset; job 101; job 102; job 103; job 104; sub --name alpha-prune-a; QA=$OUT; sub --name alpha-prune-b; QB=$OUT
@@ -339,7 +363,93 @@ check "a job submitted five days ago that the queue showed two hours ago, not ye
 echo "$(date -u -d "-5 days" +%FT%TZ)|77777|race|4.0|01:00:00|race-long-v1|1|0|1|$(date -u -d "-2 days" +%FT%TZ)" > "$FLEET_RESERVATIONS_FILE"; sub --name race-g-v1
 check "the same, last shown two days ago and still nowhere: it expires, loudly, and the job is accepted" '[ $RC = 0 ] && ! grep -q "|77777|" "$FLEET_RESERVATIONS_FILE" && echo "$ERR" | grep -q "expired"'
 
-echo "28. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "28. the time limit, read as Slurm reads it (slurm/timelimit.py): rounded up to whole minutes; zero and no limit refused"
+TL="$STAGE/slurm/timelimit.py"; TLBAD=0
+while read -r v m n; do
+  got=$(python3 "$TL" "$v" 2>&1); [ "$got" = "$m $n" ] || { TLBAD=$((TLBAD+1)); echo "    timelimit $v: got '$got', want '$m $n'"; }
+done <<'EOF'
+1 1 00:01:00
+20 20 00:20:00
+90 90 01:30:00
+0:30 1 00:01:00
+20:00 20 00:20:00
+20:01 21 00:21:00
+00:00:01 1 00:01:00
+00:20:01 21 00:21:00
+01:00:30 61 01:01:00
+2:30:00 150 02:30:00
+0:90:00 90 01:30:00
+11:30:00 690 11:30:00
+1-0 1440 1-00:00:00
+1-12 2160 1-12:00:00
+1-1:1 1501 1-01:01:00
+1-1:1:1 1502 1-01:02:00
+EOF
+check "Slurm's six forms (minutes, minutes:seconds, hours:minutes:seconds, days-hours, days-hours:minutes, days-hours:minutes:seconds), each rounded up to whole minutes: 16 cases" '[ $TLBAD = 0 ]'
+TLBAD=0
+for v in 0 00:00:00 0:0 0-0 0-0:0:0 -1 UNLIMITED unlimited INFINITE "" "1:2:3:4" "1-2-3" "1:-2" "1.5" " 1" "1 " "+5" "5-" "1-:1" "1h" "$(printf '\331\241')"; do
+  python3 "$TL" "$v" >/dev/null 2>"$T/state/tl.err"; rc=$?; { [ $rc = 2 ] && grep -q "^refused: the time limit" "$T/state/tl.err"; } || { TLBAD=$((TLBAD+1)); echo "    timelimit '$v': exit $rc, want 2 and the refusal"; }
+done
+check "zero, no limit (-1, UNLIMITED, INFINITE) and anything that is not one of the forms (a space, a sign, a fraction, a unit, an Arabic-Indic digit) refused, exit 2 and the reason: 21 cases" '[ $TLBAD = 0 ]'
+check "GPU-hours in whole numbers, rounded up to 0.001: 1 min x 4 x 1,000 = 66.667; 21 min x 4 = 1.4; 60 min x 4 = 4.0; 5 min x 4 = 0.334" '[ "$(python3 "$TL" --gpu-hours 1 4 1000 1)" = 66.667 ] && [ "$(python3 "$TL" --gpu-hours 21 4 1 1)" = 1.4 ] && [ "$(python3 "$TL" --gpu-hours 60 4 1 1)" = 4.0 ] && [ "$(python3 "$TL" --gpu-hours 5 4 1 1)" = 0.334 ]'
+reset; mkdir -p "$T/arr1000"; cp "$T/spec.json" "$T/arr1000/node_0.json"
+OUT=$(bash "$STAGE/slurm/submit.sh" --site test --time 00:00:01 --array 0-999%1 --spec-dir "$T/arr1000" --name alpha-tiny-v1 2>"$T/state/err.txt"); RC=$?; ERR=$(cat "$T/state/err.txt")
+check "the review's case: 1,000 one-second tasks (%1) are 1,000 one-minute tasks to Slurm, 66.667 GPU-hours (1.3.16 priced 1.111), over the review threshold: held for review" '[ $RC = 0 ] && echo "$ERR" | grep -q "HELD FOR REVIEW: worst case 66.667 GPU-h"'
+check "sbatch is given the rounded limit, and the reservation records it" 'calls | grep -q -- "--time=00:01:00" && grep -q "|$OUT|alpha|66.667|00:01:00|alpha-tiny-v1|1|1|1000|$" "$FLEET_RESERVATIONS_FILE"'
+reset; sub --time 00:20:01 --name alpha-t2001-v1
+check "the review's case: 00:20:01 is 21 minutes to Slurm: sbatch gets 00:21:00, the reservation 1.4 GPU-hours (1.3.16: 1.334)" '[ $RC = 0 ] && calls | grep -q -- "--time=00:21:00" && grep -q "|$OUT|alpha|1.4|00:21:00|alpha-t2001-v1|1|0|1|$" "$FLEET_RESERVATIONS_FILE"'
+reset; sub --time 20 --name alpha-t20-v1
+check "'20' is twenty minutes to Slurm, not twenty hours: 00:20:00 and 1.334 GPU-hours (1.3.16: 80)" '[ $RC = 0 ] && calls | grep -q -- "--time=00:20:00" && grep -q "|$OUT|alpha|1.334|00:20:00|" "$FLEET_RESERVATIONS_FILE"'
+reset; sub --time 1-00 --name alpha-day-v1
+check "'1-00' is a day: 1-00:00:00 and 96 GPU-hours, over the review threshold: held for review (1.3.16 could not read the form)" '[ $RC = 0 ] && calls | grep -q -- "--time=1-00:00:00" && echo "$ERR" | grep -q "HELD FOR REVIEW: worst case 96.0 GPU-h"'
+N=0; for v in 00:00:00 0 UNLIMITED -1; do reset; sub --time "$v" --name alpha-nolimit-v1; [ $RC = 2 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "no time limit" && N=$((N+1)); done
+check "the review's case: --time 00:00:00, and 0, UNLIMITED and -1, ask for no limit: each refused (exit 2), sbatch never called (1.3.16 reserved 0.0 and submitted it)" '[ $N = 4 ]'
+reset; setcap race 100; echo "901|901|1|PD|(null)|None|2026-09-20T10:00:00|race-nolimit-v1|UNLIMITED|0:00" > "$FAKE/jobs.txt"; sub --name race-next-v1
+check "a queued job of the lane with no time limit (UNLIMITED) leaves the lane without a bound: its next submission refused (exit 3; 1.3.16 counted that job as nothing)" '[ $RC = 3 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "no time limit"'
+sub --name alpha-other-lane-v1
+check "another lane is not affected: accepted" '[ $RC = 0 ]'
+
+echo "29. a chained job (--after, --afterany) is queued held and released only once its predecessors have ended and its nodes fit"
+reset; job 101; job 102; job 103; job 104; sub --nodes 2 --afterany 104 --name infra-succ-v1; S=$OUT
+check "the review's case: a two-node successor of one of four running jobs is submitted held and queued with what it waits for (1.3.16: unheld and uncounted)" '[ $RC = 0 ] && calls | grep -q -- "--hold" && grep -q "|$S|infra-succ-v1|2|afterany:104$" "$FLEET_QUEUE_FILE" && echo "$ERR" | grep -q "QUEUED BY THE FLEET GUARD (chained)"'
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 104 --quiet
+check "104 leaves: three stay, and two more nodes would make five, so it is not released" '! grep -q "^release $S$" "$FAKE/scontrol_calls.txt"'
+sed -i "s/^104|104|1|R|/104|104|1|CD|/" "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 103 --quiet
+check "104 has ended and 103 leaves: two stay, the successor's two nodes fit, released" 'grep -q "^release $S$" "$FAKE/scontrol_calls.txt"'
+reset; job 101; job 102; job 103; job 104; sub --afterany 104 --name alpha-left-v1; S1=$OUT; sub --afterany 104 --name alpha-right-v1; S2=$OUT
+check "the review's branching case: two one-node successors of one job, both held and queued" '[ $(grep -c "|afterany:104$" "$FLEET_QUEUE_FILE") = 2 ] && [ $(calls | grep -c -- "--hold") = 2 ]'
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 104 --quiet
+check "104 leaves one node: the first successor is released, the second is not (1.3.16 started both: five)" 'grep -q "^release $S1$" "$FAKE/scontrol_calls.txt" && ! grep -q "^release $S2$" "$FAKE/scontrol_calls.txt"'
+sub --name alpha-window-v1
+check "while 104 is still ending, the released successor takes its node: a new job is held, not started on a fifth" 'calls | tail -1 | grep -q -- "--hold"'
+sed -i -e "s/^104|104|1|R|/104|104|1|CD|/" -e "s/^$S1|$S1|1|PD|[^|]*|[^|]*|/$S1|$S1|1|R|(null)|None|/" "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 101 --quiet
+check "104 has ended and the first successor runs; 101 leaves: the second successor is released, the new job behind it waits" 'grep -q "^release $S2$" "$FAKE/scontrol_calls.txt" && [ $(grep -c "^release" "$FAKE/scontrol_calls.txt") = 2 ]'
+reset; job 101 1 CD; job 102; sub --afterany 101 --name alpha-late-v1
+check "a chained job whose predecessor has already ended is released at once, by a pass right after its submission" '[ $RC = 0 ] && calls | grep -q -- "--hold" && grep -q "^release $OUT$" "$FAKE/scontrol_calls.txt" && echo "$ERR" | grep -q "released it at once"'
+reset; job 101; job 102; job 103; sub --afterany 101 --name alpha-waits-v1; sub --name alpha-plain-v1
+check "a chained job still waiting for its predecessor does not count as waiting for a node: with three running the next plain job starts without a hold" '[ $RC = 0 ] && ! calls | tail -1 | grep -q -- "--hold"'
+reset; job 101; job 102; job 103; job 104
+echo "2026-11-03T10:00:00Z|777|alpha-chained-v1|1|afterany:101" > "$FLEET_QUEUE_FILE"; job 777 1 PD "afterany:101(unfulfilled)" JobHeldUser "2026-09-20T10:00:00" alpha-chained-v1
+echo "2026-11-03T10:01:00Z|778|alpha-plain-v1|1" >> "$FLEET_QUEUE_FILE"; job 778 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-plain-v1
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 102 > "$T/state/d.out"
+check "a node frees while the chained job at the head still waits for its predecessor: it is passed over and the plain job behind it released (1.3.16 released the chained one, to start by itself when 101 ended)" '! grep -q "^release 777$" "$FAKE/scontrol_calls.txt" && grep -q "^release 778$" "$FAKE/scontrol_calls.txt" && grep -q "1 of them for their predecessors" "$T/state/d.out"'
+reset; job 101; job 102; echo "2026-11-03T10:00:00Z|777|alpha-chained-v1|1|afterany:99" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-chained-v1
+echo "2026-11-03T10:00:00Z|779|alpha-chained2-v1|1|afterany:98" >> "$FLEET_QUEUE_FILE"; job 779 1 PD "afterany:98(unfulfilled)" JobHeldUser "2026-09-20T10:00:00" alpha-chained2-v1
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "predecessors gone from the queue: released once Slurm shows no dependency left (777); one Slurm still lists as unfulfilled waits (779: another account's job, or not yet updated)" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt" && ! grep -q "^release 779$" "$FAKE/scontrol_calls.txt"'
+reset; job 101 1 F; echo "2026-11-03T10:00:00Z|777|alpha-okchain-v1|1|afterok:101" > "$FLEET_QUEUE_FILE"; job 777 1 PD "afterok:101(failed)" JobHeldUser "2026-09-20T10:00:00" alpha-okchain-v1
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "an afterok predecessor that failed: never released (Slurm cancels the job, --kill-on-invalid-dep=yes)" '[ ! -s "$FAKE/scontrol_calls.txt" ]'
+reset; job 101; job 102; echo "105|105|2|PD|afterany:102(unfulfilled)|Dependency|2026-09-20T10:00:00|infra-two-v1|1:00:00|0:00" >> "$FAKE/jobs.txt"; sub --name alpha-first-v1
+check "an unheld two-node job chained behind a running one-node job counts its one extra node: with two running, one more job fits" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+sub --name alpha-second-v1
+check "and a second does not: 101, 102 (then the two-node job) and the first make four (1.3.16 started it too: five once 102 ended)" 'calls | tail -1 | grep -q -- "--hold"'
+reset; job 101; job 102; job 103; for s in 105 106; do echo "$s|$s|1|PD|afterany:103(unfulfilled)|Dependency|2026-09-20T10:00:00|other-succ-$s|1:00:00|0:00" >> "$FAKE/jobs.txt"; done; sub --name alpha-third-v1
+check "two unheld one-node jobs chained behind one running job count one extra node: with three running the fleet is full, the next job held (1.3.16: started)" 'calls | grep -q -- "--hold"'
+reset; job 101; sub --hold --afterany 101 --name alpha-ownhold-v1
+check "a chained job its lane holds itself stays out of the fleet queue (released by hand, like any held job)" '[ $RC = 0 ] && [ ! -s "$FLEET_QUEUE_FILE" ]'
+
+echo "30. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"

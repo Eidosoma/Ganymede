@@ -24,6 +24,18 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **A failed read is not an answer.** Found in the same review, and reproduced: the waiter read accounting a second time to report, that read could fail and come back partial, and a failed job missing from it turned the result into success. *Rule:* a read whose exit status is not 0 is no picture of anything; report from the read you trusted.
 
+**A second was priced as a second.** Found in a third review, and reproduced: the wrapper read the hours from `--time` as written, but Slurm rounds a limit up to whole minutes, reads `20:00` as twenty minutes and `0` as no limit at all. A thousand one-second tasks were priced 1.111 GPU-hours for what Slurm runs as 66.667, and `--time 0` passed a zero cap. *Rule:* read an input the way the system that acts on it reads it, with one parser for everything that depends on it, and refuse what has no bound.
+
+**A dependency is a start nobody checks.** Found in the same review, and reproduced: the ceiling was checked when a job was submitted, but a chained job starts when its predecessors end, without asking anyone, so a two-node successor of one of four running jobs made five. *Rule:* a job that will start on a later event is held until that event, and admitted then by the same check as every other job.
+
+**Alive is not the same as collected.** Found in the third review's second part, and reproduced: the task shell waited again for a program only while the program was alive, so one that saved and exited at once left the interrupted wait's 138, and a clean checkpoint read as a failed job. Waiting again regardless was no answer either: bash can lose a status when a signal interrupts its wait at the moment the program ends, and the second wait then blocks for good. *Rule:* a supervisor that must outlive signals does not lean on a blocking wait the signal can interrupt; it watches for the end, then collects.
+
+**The middle layer died first.** Found in the same review, and reproduced: the checkpoint signal reached a pool worker that had no handler, so it died at once while its command was still saving, and the launcher reported the pool before the save had finished. *Rule:* every process between the signal and the work outlives the signal and waits for the work; work not done is written down for the next segment.
+
+**A partial answer looked complete.** Found in the same review, and reproduced: the waiter took the array elements accounting showed as the whole array. *Rule:* know the expected set from your own record, and wait until the answer covers it.
+
+**The scheduler forgets sooner than the guard looks back.** Found in the same review, and reproduced: the rate guard counted the submissions the controller still remembered, and Slurm forgets an ended job after five minutes by default, half the guard's window. *Rule:* keep your own record of what a guard counts, for at least the guard's window.
+
 **Silence read as zero.** A failed `squeue` looked like an empty queue, so a waiter returned while the job was still running, and a budget check could read "nothing used". *Rule:* every tool fails closed. A wrapper that cannot read the queue submits nothing; a budget check that cannot read accounting refuses; a waiter believes an empty queue only when accounting shows the job has ended.
 
 **A full fleet made agents retry.** The first ceiling refused jobs when the fleet was full, and the agent had to come back later. Agents that come back later are agents that loop. *Rule:* accept and hold. The job is queued and released first in first out by a dispatcher that runs at every job's end and every submission.

@@ -29,6 +29,7 @@
 | `FLEET_LOCK_DIR` | `"${FLEET_LOCK_DIR:-/shared/receipts/.fleet.lock}"` | submit, dispatch | the fleet lock |
 | `FLEET_DISPATCH_LOG` | `"${FLEET_DISPATCH_LOG:-/shared/receipts/FLEET_DISPATCH.log}"` | dispatch | the release log |
 | `FLEET_RESERVATIONS_FILE` | `"${FLEET_RESERVATIONS_FILE:-/shared/receipts/FLEET_RESERVATIONS.log}"` | submit, budget, dispatch | accepted jobs' worst cases until the queue or accounting shows them |
+| `FLEET_SUBMISSIONS_FILE` | `"${FLEET_SUBMISSIONS_FILE:-/shared/receipts/FLEET_SUBMISSIONS.log}"` | submit, wait_jobs | one line per submission, never pruned by the tooling: the rate guard counts it beside the queue, and the waiter takes an array's element set from it |
 | `FLEET_RESERVATION_RECENT_S` | `120` (environment) | submit, dispatch | seconds an accepted job that the queue does not show yet counts toward the ceiling; keep it below Slurm's `MinJobAge` |
 
 The duplicate, rate and ceiling guards run only when `squeue` is available and at least one of `MAX_NODES_IN_FLIGHT`, `NO_DUPLICATE_NAMES` and `MAX_SUBMITS_PER_10MIN` is set.

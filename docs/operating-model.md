@@ -30,7 +30,7 @@ Why so strict? Because the failure modes of agents are loops and drift. An agent
 
 - **Measure, then price.** A time limit is at least 1.2 times the measured wall time plus a quarter of an hour, from a qualification run at the registered size. A short or scaled-down qualification underprices the full run; in one lane a bounded pilot priced the histories 50 % low and the memory 21 % low.
 - **No limit under 20 minutes.** Slurm's checkpoint warning arrives 15 minutes before the limit (`SIGNAL_BEFORE_END`); a shorter job would be warned almost as it starts.
-- **State the worst case.** The time limit times the GPUs held. That is what the budget check uses and what the principal approves.
+- **State the worst case.** The time limit (as Slurm rounds it: up to whole minutes) times the GPUs held. That is what the budget check uses and what the principal approves.
 - **Respect the maximum wall time.** On JUPITER a `--time` over 12 hours is refused at `sbatch`, after the word was spent. Longer work runs as checkpointed segments.
 - **Card activity targets.** The original fleet asked for at least 70 % GPU utilisation and 50 % active SMs over a job, and for a stated exception when a job could not meet them. The receipt shows what was achieved.
 

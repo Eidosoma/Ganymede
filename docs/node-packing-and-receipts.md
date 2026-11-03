@@ -30,7 +30,7 @@ A node is never held with an idle GPU. The launcher refuses a spec with fewer GP
 | `job` | the job name; it starts with the lane tag (`alpha-`), which is how hours are charged |
 | `gpu_tasks[]` | one task per GPU: `name`, `cmd` (run with `bash -lc`), `cwd`, `threads` (cores for this task), optional `env` |
 | `cpu_tasks[]` | sidecars: the same keys, plus optional `mem_gb` (an address-space limit, `ulimit -v`) |
-| `cpu_pools[]` | many small commands: `cmd_file` holds one shell command per line (blank lines and `#` comments skipped); `parallel` workers, each pinned to `threads` cores, take the lines in stride order; every command's exit code and seconds are logged; `mem_gb` per worker |
+| `cpu_pools[]` | many small commands: `cmd_file` holds one shell command per line (blank lines and `#` comments skipped); `parallel` workers, each pinned to `threads` cores, take the lines in stride order; every command's exit code and seconds are logged; `mem_gb` per worker; under the checkpoint signal a worker starts nothing more, waits for its running command, and the commands not finished go to `<pool>.resume.cmds` |
 | keys starting with `_` | ignored; use `_note` for a human-readable description |
 
 Examples are in [`examples/specs/`](../examples/specs/).
@@ -71,7 +71,9 @@ Size sidecars to end with the GPU work. The launcher refuses an idle GPU at the 
 
 ## Signals and checkpoints
 
-Slurm sends `SIGUSR1` `SIGNAL_BEFORE_END` seconds before the limit. The batch shell forwards it to the launcher, which forwards it to every task's process group. A task should save its state, exit 0, and support `--resume`. If every task then exits 0, the receipt says `checkpoint_segment: true` and `all_ok` stays true: the contract worked, and the next segment is a new job. `SIGTERM` (a cancel, the watchdog) is forwarded too; after `--grace` seconds (60) whatever is left is killed, and the job is a failure. Every process of a task's group gets the signal, and the task's shell waits for the running command, exits with its status and starts nothing more, so a compound command (`python train.py; echo done`) checkpoints like a single one, and so does a program started with `&` and waited for (`python train.py & wait $!`): when the signal interrupts the shell's own `wait`, the shell waits again for the program and takes its status. A program killed by signal N reads exit 128+N. Do not leave a program running in the background without waiting for it: the task would end, and the program with the job.
+Slurm sends `SIGUSR1` `SIGNAL_BEFORE_END` seconds before the limit. The batch shell forwards it to the launcher, which forwards it to every task's process group. A task should save its state, exit 0, and support `--resume`. If every task then exits 0, the receipt says `checkpoint_segment: true` and `all_ok` stays true: the contract worked, and the next segment is a new job. `SIGTERM` (a cancel, the watchdog) is forwarded too; after `--grace` seconds (60) whatever is left is killed, and the job is a failure. Every process of a task's group gets the signal, and the task's shell waits for the running command, exits with its status and starts nothing more, so a compound command (`python train.py; echo done`) checkpoints like a single one, and so does a program started with `&` and waited for (`python train.py & wait $!`), also one that saves at once: the task shell has its own `wait`, which checks its background programs every 50 ms and asks bash for a status only once the program has ended, because bash can lose the status of a program that ends at the moment a signal interrupts its `wait`. A program killed by signal N reads exit 128+N. Do not leave a program running in the background without waiting for it: the task would end, and the program with the job.
+
+**Pools under the signal.** A pool worker starts no new command; it waits for the running one, which has the signal too, and records its status as interrupted. The launcher writes the commands not finished (interrupted, then never started, in file order) to `<pool>.resume.cmds` in the receipt folder: run that file in the next segment's pool. Under `SIGUSR1` a pool counts towards `checkpoint_segment` when no command it finished had failed; an interrupted command is kept, not judged, so pool commands must be safe to run again. A pool command that saves on the signal should `exec` its program, or handle the signal in its shell.
 
 ## The GPU-idle watchdog
 
@@ -87,9 +89,9 @@ A watchdog-ended job is a failure to read: a runner waiting for work that can ne
 |---|---|
 | `job`, `host`, `mode`, `started`, `ended`, `slurm` | what ran, where, when; the Slurm job id, name, nodes, GPUs, partition, account |
 | `tasks[]` | per task: `kind`, `name`, `slot`, `cores`, `cmd`, `wall_s`, `exit`, `utime_s`, `stime_s`, `maxrss_kb`, `stdout`, `stderr` |
-| `pools[]` | per pool: commands, completed, failed, workers, cores, command-seconds |
+| `pools[]` | per pool: commands, completed, failed, interrupted (with their exits), not started, the resume file, workers, cores, command-seconds |
 | `wall_s`, `gpu_slot_hours_held` | wall time; slots times wall time |
-| `all_ok`, `checkpoint_segment`, `interrupted` | the verdict: every task exited 0 (and every pool command), whether this was a clean checkpoint segment, which signal ended it |
+| `all_ok`, `checkpoint_segment`, `interrupted` | the verdict: every task exited 0 and no pool command failed (under `SIGUSR1` a pool's unfinished commands wait in its resume file), whether this was a clean checkpoint segment, which signal ended it |
 | `launch_error` | a task that could not be started: which one, why, and the tasks never started; the ones already started were stopped |
 | `gpu_summary` | per GPU slot, means over the job: `gpu_util`, `sm_active`, `sm_occupancy`, `tensor_active`, `dram_bw`, `busy_fraction`, `peak_mem_mib`, and the `source` (`gpm` or `nvidia-smi`) |
 | `gpu_imbalance` | true when the slots' busy fractions differ by 0.5 or more |

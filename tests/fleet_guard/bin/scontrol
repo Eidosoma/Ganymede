@@ -1,4 +1,4 @@
 #!/bin/bash
 echo "$*" >> "$FAKE/scontrol_calls.txt"
-if [ "$1" = release ]; then awk -F'|' -v OFS='|' -v j="$2" '$2==j && $6=="JobHeldUser"{$6="None"} {print}' "$FAKE/jobs.txt" > "$FAKE/jobs.tmp" && mv "$FAKE/jobs.tmp" "$FAKE/jobs.txt"; fi
+if [ "$1" = release ]; then awk -F'|' -v OFS='|' -v j="$2" '$2==j && $6=="JobHeldUser"{$6=(($5=="(null)" || $5=="") ? "None" : "Dependency")} {print}' "$FAKE/jobs.txt" > "$FAKE/jobs.tmp" && mv "$FAKE/jobs.tmp" "$FAKE/jobs.txt"; fi
 exit 0

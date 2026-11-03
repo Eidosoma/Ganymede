@@ -6,7 +6,7 @@ while [ $# -gt 0 ]; do case "$1" in --site) SITE="$2"; shift 2;; --hours) HOURS=
 echo "# fleet status $(date -u +%FT%TZ) site=$SITE host=$(hostname)"
 echo; echo "## budget (GPU-hours: used since BUDGET_SINCE, committed by the queue, cap, headroom; jobs running/pending)"; python3 "$HERE/budget.py" --site "$SITE"
 echo; echo "## queue"; squeue -u "$USER" --Format="JobID:9,Name:30,Partition:14,StateCompact:4,TimeUsed:11,TimeLimit:11,NumCPUs:6,tres-per-node:14,Reason:24"
-echo; echo "## waiting for a node (accepted and held by the wrapper, released first in first out; time UTC | job | name | nodes at once)"; if [ -s "$JDIR/receipts/FLEET_QUEUE.log" ]; then cat "$JDIR/receipts/FLEET_QUEUE.log"; else echo "(nobody)"; fi
+echo; echo "## waiting for a node (accepted and held by the wrapper, released first in first out; time UTC | job | name | nodes at once | for a chained job, what it waits for)"; if [ -s "$JDIR/receipts/FLEET_QUEUE.log" ]; then cat "$JDIR/receipts/FLEET_QUEUE.log"; else echo "(nobody)"; fi
 SINCE=$(date -u -d "-${HOURS} hours" +%FT%T 2>/dev/null || date -u +%F)
 echo; echo "## finished in the last ${HOURS} h (accounting)"; sacct -X -n -P -u "$USER" --starttime "$SINCE" --format=JobID,JobName,Partition,State,ElapsedRaw,AllocTRES | awk -F'|' '$4!="RUNNING" && $4!="PENDING" {gsub(/billing=[0-9]+,/,"",$6); printf "%8s %-28s %-12s %-10s %6ss %s\n",$1,$2,$3,$4,$5,$6}'
 echo; echo "## receipts (JOBS.log, last ${HOURS} h)"; if [ -f "$JDIR/receipts/JOBS.log" ]; then awk -v since="$SINCE" '$1 >= since' "$JDIR/receipts/JOBS.log" | grep -v ' START ' || echo "(none)"; else echo "(no JOBS.log yet)"; fi

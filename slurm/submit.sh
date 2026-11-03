@@ -2,11 +2,14 @@
 # submit.sh: the only way a fleet job reaches Slurm. One whole node per (array) task; account, partition, gres, cores, time and the
 # checkpoint warning come from the site file (slurm/site.<SITE>.env).
 #
-#   submit.sh [--site NAME] [--devel] [--time HH:MM:SS] [--array 0-N%M --spec-dir DIR] [--name NAME] [--pack "extra pack_node args"]
+#   submit.sh [--site NAME] [--devel] [--time LIMIT] [--array 0-N%M --spec-dir DIR] [--name NAME] [--pack "extra pack_node args"]
 #             [--cpu-only [--cores N]] [--force-node --reason "..."] [--after ID[:ID..]] [--afterany ID[:ID..]]
 #             [--low] [--hold] [--over-cap-ok] [--nodes N] [--comment "KEY=VALUE;KEY=VALUE"] [--allow-same-name] SPEC
 #
 # Guards. Each fails closed: if the queue or the accounting cannot be read, nothing is submitted. There is no loop and no retry here.
+#   time limit    --time takes any of Slurm's forms and is read as Slurm reads it (slurm/timelimit.py): rounded up to whole
+#                 minutes; 0, -1, INFINITE and UNLIMITED, which mean no limit, are refused (exit 2). The rounded limit is what sbatch
+#                 is given and what the budget, the review threshold and the reservation see
 #   budget        the job name starts with a lane tag (alpha-...) that has a cap in caps.json; a job whose worst case (time limit x
 #                 GPUs x array tasks x nodes) would take the lane over its cap is refused (exit 3; --over-cap-ok overrides), and so is
 #                 every job while caps.json is missing, unreadable or empty or has no finite, non-negative cap for the lane. The check
@@ -14,14 +17,18 @@
 #                 or accounting shows it, so two submissions can never spend the same headroom
 #   review hold   a worst case above REVIEW_THRESHOLD_HOURS is submitted held for a human's review; the principal releases or cancels it
 #   duplicates    a job whose name is already pending or running on the account is refused (exit 5) unless --allow-same-name
-#   rate          more than MAX_SUBMITS_PER_10MIN submissions from the account inside ten minutes are refused (exit 6)
+#   rate          more than MAX_SUBMITS_PER_10MIN submissions from the account inside ten minutes are refused (exit 6), counted
+#                 from the queue and from the fleet's own record of every submission (FLEET_SUBMISSIONS_FILE), which keeps jobs the
+#                 controller has already forgotten
 #   arrays        an array must carry a throttle (0-29%1), and throttle x nodes may not exceed MAX_NODES_IN_FLIGHT (exit 2 / 4)
 #   no requeue    jobs are submitted --no-requeue, so a node failure never restarts a job by itself
 #   ceiling       where MAX_NODES_IN_FLIGHT is set, a job that would put more of the account's nodes in flight (running, plus pending
 #                 without a dependency and not held, the pending part of an array by the elements its throttle lets run at once;
 #                 slurm/inflight.py) is ACCEPTED AND HELD, written to the fleet queue (FLEET_QUEUE_FILE) and released first in first
 #                 out by slurm/fleet_dispatch.sh, which runs at the end of every fleet job and at every submission.
-#                 Submit once and never retry. Held (--hold) and chained submissions are not counted.
+#                 Submit once and never retry. A job held by its lane or for review is not counted. A chained job (--after,
+#                 --afterany) is queued held whatever is in flight, because Slurm starts it the moment its predecessors end; the
+#                 dispatcher releases it in its turn once they have ended and its nodes fit
 #   one at a time submissions take a fleet-wide lock (an atomic mkdir on the shared filesystem), always; its holder refreshes it while
 #                 it works, and a lock nobody has refreshed for FLEET_LOCK_STALE_S seconds (180) belongs to a dead holder and is taken over
 # --nodes N: a multi-node job (N whole nodes); the same spec runs on every node under srun, one launcher per node, with SLURM_NNODES,
@@ -30,6 +37,7 @@
 #           NVIDIA_GPU_CLOCKS, CPU_POWER_CAP and THP). Commas and quotes are refused. Recorded in the job log.
 # --low: filler priority (sbatch --nice=1000). --hold: submitted held, released with `scontrol release ID`.
 # --after / --afterany: chain behind earlier jobs (Slurm afterok / afterany); a chain that can never start is cancelled, not left pending.
+#           Under a ceiling the chained job waits held in the fleet queue until its predecessors have ended and its nodes fit.
 # CPU-only specs (no gpu_tasks): allowed where the site has CPU_PARTITION (shared cores, no gres, --cores N); elsewhere refused unless
 # --force-node --reason, which holds (and is charged for) a whole node.
 # Exit codes: 0 submitted or queued; 1 usage or a missing spec; 2 refused spec or options; 3 budget; 4 ceiling, lock or unreadable queue;
@@ -58,6 +66,12 @@ if [ "$NGPU_TASKS" = 0 ] && [ $CPU_ONLY = 0 ] && [ $FORCE_NODE = 0 ]; then echo 
 if [ $CPU_ONLY = 1 ] && [ "$NGPU_TASKS" != 0 ]; then echo "refused: --cpu-only with gpu_tasks in the spec"; exit 2; fi
 if [ $FORCE_NODE = 1 ] && [ -z "$REASON" ]; then echo "--force-node needs --reason"; exit 2; fi
 if [ $DEVEL = 1 ]; then PART="$DEVEL_PARTITION"; TIME="${TIME:-$DEVEL_MAX_TIME}"; else PART="$PARTITION"; TIME="${TIME:-$MAX_TIME}"; fi
+# One reading of the time limit: slurm/timelimit.py applies Slurm's own rules (rounded UP to whole minutes; 0 and UNLIMITED
+# mean no limit and are refused), and the rounded limit is what sbatch gets, what the budget is charged, what the review threshold
+# sees and what the reservation records. Read from the text as given, the hours once priced 00:00:01 as one second of a job Slurm
+# runs for a minute, 20:00 (twenty minutes to Slurm) as twenty hours, and 0 (no limit) as nothing.
+TLIM=$(python3 "$HERE/timelimit.py" "$TIME") || exit 2
+MINUTES="${TLIM%% *}"; TIME="${TLIM#* }"
 mkdir -p "$JDIR/logs" "$JDIR/receipts"
 if [ $CPU_ONLY = 1 ] && [ $FORCE_NODE = 0 ]; then
   [ -n "${CPU_PARTITION:-}" ] || { echo "refused: site '$SITE' has no CPU partition; CPU work rides as sidecars in a GPU spec, or --force-node --reason holds a whole node"; exit 2; }
@@ -75,13 +89,13 @@ fi
 [ -n "$ARRAY" ] && ARGS+=(--array="$ARRAY")
 [ $LOW = 1 ] && ARGS+=(--nice=1000)
 [ $HOLD = 1 ] && ARGS+=(--hold)
-# worst case for the budget: time limit x GPUs (0 for --cpu-only), x array size
+# worst case for the budget: the rounded time limit x GPUs x array size x nodes, rounded UP to 0.001 GPU-hours (0 for --cpu-only)
 LANE="${NAME%%-*}"; NTASKS=1; [ -n "$ARRAY" ] && NTASKS=$(python3 -c "import re,sys;s=sys.argv[1].split('%')[0];n=0
 for p in s.split(','):
     a,_,b=p.partition('-'); n+= (int(b)-int(a)+1) if b else 1
 print(n)" "$ARRAY")
 [ -n "$LANE" ] || { echo "refused: the job name '$NAME' has no lane tag; it must start with the lane's tag and a hyphen (alpha-what-v1)" >&2; exit 2; }
-if [ $CPU_ONLY = 1 ] && [ $FORCE_NODE = 0 ]; then EST=0; else EST=$(python3 -c "import sys;h,m,s=(sys.argv[1].split(':')+['0','0'])[:3];print(round((int(h)+int(m)/60+int(s)/3600)*int(sys.argv[2])*int(sys.argv[3])*int(sys.argv[4]),3))" "$TIME" "$GPUS_PER_NODE" "$NTASKS" "$NODES"); fi
+if [ $CPU_ONLY = 1 ] && [ $FORCE_NODE = 0 ]; then EST=0; else EST=$(python3 "$HERE/timelimit.py" --gpu-hours "$MINUTES" "$GPUS_PER_NODE" "$NTASKS" "$NODES"); fi
 if [ "${REVIEW_THRESHOLD_HOURS:-0}" != 0 ] && [ $HOLD = 0 ] && python3 -c "import sys;sys.exit(0 if float(sys.argv[1])>float(sys.argv[2]) else 1)" "$EST" "$REVIEW_THRESHOLD_HOURS"; then
   HOLD=1; ARGS+=(--hold); echo "HELD FOR REVIEW: worst case ${EST} GPU-h exceeds the review threshold ${REVIEW_THRESHOLD_HOURS}; a reviewer checks the job against the lane's plan and reports; the principal releases it (scontrol release ID) or cancels it" >&2
 fi
@@ -91,9 +105,10 @@ if [ -n "$COMMENT" ]; then
 fi
 # Guards against one node too many, a repeated job and a runaway loop (see the header). One queue snapshot feeds all of them.
 # Fail closed: if the queue cannot be read or the fleet lock cannot be taken, nothing is submitted.
-GUARD_QUEUED=0; WAITING=0; WANT="$NODES"
+GUARD_QUEUED=0; CHAINED=0; WAITING=0; WANT="$NODES"
 QFILE="${FLEET_QUEUE_FILE:-$JDIR/receipts/FLEET_QUEUE.log}"; LOCK="${FLEET_LOCK_DIR:-$JDIR/receipts/.fleet.lock}"
 RFILE="${FLEET_RESERVATIONS_FILE:-$JDIR/receipts/FLEET_RESERVATIONS.log}"; LOCKED=0
+SFILE="${FLEET_SUBMISSIONS_FILE:-$JDIR/receipts/FLEET_SUBMISSIONS.log}"
 if command -v squeue >/dev/null 2>&1; then
   # One submission at a time across the fleet: an atomic mkdir on the shared filesystem, taken whether or not the queue guards are
   # configured, because the budget check below depends on it. The holder refreshes the lock while it works (a cold budget read can
@@ -117,7 +132,7 @@ fi
 # The budget check runs inside the lock, after every earlier submission has been made and reserved, so two submissions can never both
 # spend the same headroom. Its committed hours include the reservations of accepted jobs that the queue or accounting does not show yet.
 if [ $OVERCAP = 0 ]; then FLEET_LOCK_HELD=$LOCKED FLEET_RESERVATIONS_FILE="$RFILE" python3 "$HERE/budget.py" --site "$SITE" --lane "$LANE" --est-hours "$EST" >/dev/null || { echo "refused by the budget check (worst case ${EST} GPU-h for lane $LANE); see slurm/budget.py --site $SITE, or --over-cap-ok"; exit 3; }; fi
-echo "worst-case charge for this submission: ${EST} GPU-h (lane $LANE)" >&2
+echo "worst-case charge for this submission: ${EST} GPU-h (lane $LANE, time limit $TIME)" >&2
 if [ $LOCKED = 1 ] && [ -n "${MAX_NODES_IN_FLIGHT:-}${NO_DUPLICATE_NAMES:-}${MAX_SUBMITS_PER_10MIN:-}" ]; then
   QSNAP=$(SLURM_BITSTR_LEN=0 squeue -A "$ACCOUNT" -h -t all -o '%D|%t|%E|%r|%V|%F|%j|%i' 2>/dev/null) || { echo "refused: the queue could not be read (squeue failed), so the guards cannot run; nothing was submitted; try again in a minute" >&2; exit 4; }
   qsnap() { printf '%s\n' "$QSNAP"; }
@@ -126,6 +141,9 @@ if [ $LOCKED = 1 ] && [ -n "${MAX_NODES_IN_FLIGHT:-}${NO_DUPLICATE_NAMES:-}${MAX
     if [ "$DUP" -gt 0 ]; then echo "refused by the duplicate guard: a job named $NAME is already pending or running on the account (see: TZ=UTC squeue -A $ACCOUNT -n $NAME). If it is held, it is waiting for a node or for review: do not resubmit it. If a second copy is really intended, for example the next segment of the same run, add --allow-same-name." >&2; exit 5; fi
   fi
   if [ -n "${MAX_SUBMITS_PER_10MIN:-}" ]; then
+    # submissions in the last ten minutes: the queue's submit times, and the fleet's own record of every submission. The
+    # controller forgets an ended job MinJobAge seconds after it ends (Slurm's default is 300, under the ten-minute window), so short
+    # jobs that failed fast fell out of the count; the record keeps them. A job that both show counts once.
     RECENT=$(qsnap | python3 -c "import sys,datetime as d
 now=d.datetime.now(); ids=set()
 for l in sys.stdin:
@@ -134,19 +152,35 @@ for l in sys.stdin:
         try:
             if (now-d.datetime.fromisoformat(f[4])).total_seconds()<600: ids.add(f[5])
         except ValueError: pass
-print(len(ids))")
+nowu=d.datetime.now(d.timezone.utc).replace(tzinfo=None)
+try: rec=open(sys.argv[1]).read().splitlines()
+except FileNotFoundError: rec=[]
+for l in rec:
+    f=l.split('|')
+    try:
+        if len(f)>=2 and f[1] and (nowu-d.datetime.strptime(f[0],'%Y-%m-%dT%H:%M:%SZ')).total_seconds()<600: ids.add(f[1])
+    except ValueError: pass
+print(len(ids))" "$SFILE")
     if [ "$RECENT" -ge "$MAX_SUBMITS_PER_10MIN" ]; then echo "refused by the rate guard: $RECENT submissions from the account in the last ten minutes (limit $MAX_SUBMITS_PER_10MIN). If a loop is submitting, stop it; if it is only a busy moment, wait a few minutes." >&2; exit 6; fi
   fi
   if [ -n "${MAX_NODES_IN_FLIGHT:-}" ] && { [ $CPU_ONLY = 0 ] || [ $FORCE_NODE = 1 ]; }; then
     CONC=1; if [ -n "$ARRAY" ]; then CONC="$THROTTLE"; fi
     WANT=$((NODES*CONC))
     if [ "$WANT" -gt "$MAX_NODES_IN_FLIGHT" ]; then echo "refused: this submission would use $WANT node(s) at once (nodes x array throttle); the limit is $MAX_NODES_IN_FLIGHT, held or chained or not" >&2; exit 4; fi
-    if [ $HOLD = 0 ] && [ -z "$AFTER$AFTERANY" ]; then
+    if [ $HOLD = 0 ]; then
       # nodes in flight (slurm/inflight.py, shared with the dispatcher): the pending part of an array counts the elements its throttle
-      # lets run at once; an accepted job the queue does not show yet counts from its reservation
-      INFLIGHT=$(qsnap | python3 "$HERE/inflight.py" --fields D,t,E,r,V,F,j,i --reservations "$RFILE") || { echo "refused: the nodes in flight could not be computed; nothing was submitted" >&2; exit 4; }
-      if [ -s "$QFILE" ]; then WAITING=$(qsnap | awk -F'|' -v qf="$QFILE" 'BEGIN{while((getline l < qf)>0){split(l,a,"|"); q[a[2]]=1}} $2=="PD" && $4 ~ /JobHeldUser/ && ($6 in q) && !($6 in seen) {seen[$6]=1; c++} END{print c+0}'); fi
-      if [ "$WAITING" -gt 0 ] || [ $((INFLIGHT+WANT)) -gt "$MAX_NODES_IN_FLIGHT" ]; then
+      # lets run at once; an accepted job the queue does not show yet counts from its reservation; an unheld chained job counts what it
+      # needs beyond its predecessors' nodes. With --queue the same reading lists the fleet queue's held jobs: 'R|..' for one that
+      # waits only for a node, 'D|..' for one that still waits for a predecessor (it is not counted as waiting: it cannot start yet)
+      QV=$(qsnap | python3 "$HERE/inflight.py" --fields D,t,E,r,V,F,j,i --reservations "$RFILE" --queue "$QFILE") || { echo "refused: the nodes in flight could not be computed; nothing was submitted" >&2; exit 4; }
+      INFLIGHT="${QV%%$'\n'*}"; case "$INFLIGHT" in ''|*[!0-9]*) echo "refused: the nodes in flight could not be read; nothing was submitted" >&2; exit 4;; esac
+      WAITING=$(printf '%s\n' "$QV" | awk '/^R\|/{c++} END{print c+0}')
+      if [ -n "$AFTER$AFTERANY" ]; then
+        # a chained job starts by itself the moment its predecessors end, whatever is in flight then (a two-node successor of one
+        # of four running jobs once made five): the fleet holds it, and the dispatcher releases it in its turn once its
+        # predecessors have ended, or are ending, and its nodes fit
+        GUARD_QUEUED=1; CHAINED=1; ARGS+=(--hold)
+      elif [ "$WAITING" -gt 0 ] || [ $((INFLIGHT+WANT)) -gt "$MAX_NODES_IN_FLIGHT" ]; then
         # the fleet is full, or others are already waiting: accept the job, hold it, and let the dispatcher start it in turn
         GUARD_QUEUED=1; ARGS+=(--hold)
       fi
@@ -160,12 +194,27 @@ if [ -n "$AFTER" ]; then ARGS+=(--kill-on-invalid-dep=yes); fi
 echo "sbatch ${ARGS[*]} slurm/node.sbatch" >&2
 JOBID=$(sbatch --parsable "${ARGS[@]}" "$JDIR/slurm/node.sbatch")
 echo "$JOBID"
+# the fleet's record of every submission: one line each, written under the fleet lock and never pruned by the tooling, for the
+# rate guard (the controller forgets ended jobs) and for wait_jobs.py (an array's element set, which accounting may show in part).
+# UTC|job|name|lane|array (- for none)|tasks|nodes|time limit|dependency (- for none)
+echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$LANE|${ARRAY:--}|$NTASKS|$NODES|$TIME|${DEPS:--}" >> "$SFILE" || echo "WARNING: the submission record $SFILE could not be written; job ${JOBID%%;*} is submitted" >&2
 # reserve the job's worst case, still inside the lock, until the queue or accounting shows the job (budget.py drops it then)
 # the reservation also carries the nodes this job uses at once, whether it was submitted held or chained (it then cannot start by
 # itself), its task count, and an empty field for when the queue last showed it (the budget check fills it in)
 HELDNOW=0; { [ $HOLD = 1 ] || [ $GUARD_QUEUED = 1 ] || [ -n "$DEPS" ]; } && HELDNOW=1
 if [ "$EST" != 0 ]; then echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$LANE|$EST|$TIME|$NAME|$WANT|$HELDNOW|$NTASKS|" >> "$RFILE"; fi
 if [ $GUARD_QUEUED = 1 ]; then
-  echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$WANT" >> "$QFILE"
-  echo "QUEUED BY THE FLEET GUARD: job ${JOBID%%;*} is accepted and held, position $((WAITING+1)) in the fleet queue. It is released automatically, first in first out, when a node frees ($MAX_NODES_IN_FLIGHT at once). Do NOT resubmit it. Queue: $QFILE; the principal can also start it by hand with: scontrol release ${JOBID%%;*}" >&2
+  echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$WANT${DEPS:+|$DEPS}" >> "$QFILE"
+  if [ $CHAINED = 1 ]; then
+    # its predecessors may have ended already: one pass now, inside the lock, releases it if so and if its nodes fit; otherwise the
+    # pass at a predecessor's end, or at any later submission, does
+    DPASS=$(FLEET_LOCK_HELD=1 bash "$HERE/fleet_dispatch.sh" --site "$SITE" 2>&1) || true
+    if [[ $'\n'"$DPASS" == *$'\n'"released ${JOBID%%;*} ("* ]]; then
+      echo "CHAINED: job ${JOBID%%;*} ($DEPS): its predecessors have ended and its $WANT node(s) fit, so the fleet guard released it at once." >&2
+    else
+      echo "QUEUED BY THE FLEET GUARD (chained): job ${JOBID%%;*} is accepted and held until its predecessors ($DEPS) have ended; then it is released in its turn, first in first out, when its $WANT node(s) fit ($MAX_NODES_IN_FLIGHT at once). Do NOT resubmit it, and do not release it by hand: a chained job that is not held starts by itself the moment its predecessors end, whatever is running then. Queue: $QFILE" >&2
+    fi
+  else
+    echo "QUEUED BY THE FLEET GUARD: job ${JOBID%%;*} is accepted and held, position $((WAITING+1)) in the fleet queue. It is released automatically, first in first out, when a node frees ($MAX_NODES_IN_FLIGHT at once). Do NOT resubmit it. Queue: $QFILE; the principal can also start it by hand with: scontrol release ${JOBID%%;*}" >&2
+  fi
 fi

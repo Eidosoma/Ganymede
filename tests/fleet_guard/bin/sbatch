@@ -3,8 +3,12 @@
 [ -e "$FAKE/sbatch_fail" ] && { echo "sbatch: error: Batch job submission failed: Socket timed out" >&2; exit 1; }
 echo "$*" >> "$FAKE/sbatch_calls.txt"
 N=$(( $(cat "$FAKE/next_id" 2>/dev/null || echo 5000) + 1 )); echo $N > "$FAKE/next_id"
-name=job; nodes=1; dep='(null)'; reason=None; lim='1:00:00'; arr=''
-for a in "$@"; do case "$a" in --job-name=*) name="${a#*=}";; --nodes=*) nodes="${a#*=}";; --dependency=*) dep="${a#*=}(unfulfilled)"; reason=Dependency;; --hold) reason=JobHeldUser;; --time=*) lim="${a#*=}";; --array=*) arr="${a#*=}";; esac; done
+name=job; nodes=1; dep='(null)'; reason=None; lim='1:00:00'; arr=''; held=0
+for a in "$@"; do case "$a" in --job-name=*) name="${a#*=}";; --nodes=*) nodes="${a#*=}";; --dependency=*) dep="${a#*=}";; --hold) held=1;; --time=*) lim="${a#*=}";; --array=*) arr="${a#*=}";; esac; done
+# Slurm's forms: the dependency as one 'kind:job(unfulfilled)' per predecessor joined by ','; a held job keeps the reason JobHeldUser
+# whatever its dependency (src/slurmctld/job_mgr.c, Slurm 25.05), an unheld one waiting on a dependency shows Dependency
+if [ "$dep" != '(null)' ]; then d=""; IFS=',' read -ra its <<< "$dep"; for it in "${its[@]}"; do k="${it%%:*}"; IFS=':' read -ra js <<< "${it#*:}"; for x in "${js[@]}"; do d="${d:+$d,}$k:$x(unfulfilled)"; done; done; dep="$d"; reason=Dependency; fi
+[ $held = 1 ] && reason=JobHeldUser
 shown="$N"; [ -n "$arr" ] && shown="${N}_[$arr]"   # the pending part of an array is one row, as squeue shows it
 echo "$shown|$N|$nodes|PD|$dep|$reason|$(date +%FT%T)|$name|$lim|0:00" >> "$FAKE/jobs.txt"
 echo "$N"

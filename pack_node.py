@@ -18,13 +18,18 @@ Spec (JSON):
    "cpu_tasks": [{"name": "audit", "cmd": "python audit.py", "cwd": "/path", "threads": 4}, ...]}
 CPU pools: "cpu_pools": [{"name": "planners", "cmd_file": "cmds.txt", "threads": 1, "parallel": 64, "cwd": "...", "mem_gb": 4}]
 runs the commands of a file (one per line) through a pool of `parallel` workers pinned one core each on the sidecar cores,
-recording per-command exit codes; this is how a node's spare cores are filled with hundreds of small jobs.
+recording per-command exit codes; this is how a node's spare cores are filled with hundreds of small jobs. Under the checkpoint
+signal (SIGUSR1, and SIGTERM) a worker starts nothing more, waits for its running command and records its status, marked
+interrupted; the launcher writes the commands not finished, interrupted and never started, in file order, to
+<pool>.resume.cmds in the receipt folder: the next segment's pool runs that file. Under SIGUSR1 a pool counts towards the
+checkpoint segment when no command it finished had failed: an interrupted command is kept, not judged (its status is in
+the receipt), so pool commands must be safe to run again.
 Sidecars (cpu_tasks and pools) run at --sidecar-nice (default 10) so GPU feeders win any contention; a task's "mem_gb" sets an
 address-space limit (ulimit -v) so a sidecar cannot push a GPU feeder into swap. --gpu-cores reserves cores per GPU task
 (JUPITER: 8 of 72 per socket, NUMA-local with --numa); everything else is sidecar territory.
 Each task gets: CUDA_VISIBLE_DEVICES (its GPU, or "" in fake mode), PACK_SLOT, PACK_TASK, PACK_JOB, PACK_CORES, PACK_RECEIPT_DIR (the job's receipt folder, for small per-task records),
 OMP_NUM_THREADS / MKL_NUM_THREADS / OPENBLAS_NUM_THREADS / NUMEXPR_NUM_THREADS / TORCH_NUM_THREADS = threads, and is pinned with taskset to its cores.
-Receipt: <receipt-dir>/receipt.json and receipt.md (per-task wall, exit code, user/system CPU seconds, max RSS, checkpoint_segment when SIGUSR1 was forwarded and every task then exited 0,
+Receipt: <receipt-dir>/receipt.json and receipt.md (per-task wall, exit code, user/system CPU seconds, max RSS, checkpoint_segment when SIGUSR1 was forwarded and every task then exited 0 and no pool command had failed,
 GPU-slot-hours held = slots * wall / 3600, optional nvidia-smi samples). Exit code: 0 if every task exited 0, else 1;
 2 for a refused spec.
 Signals: SIGUSR1 (Slurm's --signal warning before the wall limit) and SIGTERM are forwarded to every task, then the launcher
@@ -47,15 +52,29 @@ def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 # The task shell outlives the forwarded signal. SIGUSR1 and SIGTERM go to the task's whole process group; a shell that is still a
 # parent (a compound command such as "python train.py; echo done") used to die of the signal at once, so the launcher stopped waiting
 # while the program was still saving. With this trap the shell waits for the running command, then exits with its status and starts
-# nothing more. (A program killed by signal N reads exit 128+N; a single command that the shell used to replace read -N.) When the
-# signal interrupts the shell's own `wait` (a program started with & and waited for), the shell waits again for the same program and
-# takes its status: the interrupted wait's 128+N is not the program's. A foreground program that died of the signal still reads 128+N.
+# nothing more. (A program killed by signal N reads exit 128+N; a single command that the shell used to replace read -N.)
+# A program started with & and waited for (`program & wait $!`): a trapped signal makes bash's own wait return 128+N, and when the
+# program ends in that same moment (a save that takes no time) bash can lose the program's status: a second wait then answers -1 or
+# blocks for good, and a liveness test before the second wait keeps the interrupted 128+N instead (a clean, immediate save then
+# reads as a failed job). So the task shell has its own `wait`: for its
+# own background programs it checks every 50 ms whether they still run (a timed read on a pipe it holds open, no process started)
+# and calls bash's wait only once they have ended, when the status is collected at once; the trap does the same for what the shell
+# was waiting for, then for every other background program. A program that has ended but is not reaped yet (a zombie in /proc,
+# which kill -0 still finds) counts as ended; the job list is taken in a subshell that ignores the two signals; and inside the trap
+# the pause is `sleep 0.05`, not a timed read nested in the interrupted one. Its answers are bash's (the last pid's status; 0 for a plain wait; 127
+# for a pid that is not a child), also under set -e. With an option (-n) or a job spec (%1) it is bash's wait itself.
 # A child of the shell that inherited the trap (forked for `program &` and signalled before it became the program) resets it and dies
 # of the signal, as it would without the trap: it must never answer with the trap's status (it once exited 0, read as a success).
-TASK_SHELL = ('__pk_main=$BASHPID\n'
-              '__pk_stop() { local sig=$1 rc=$2 cmd=$3 p live=; if [ "$BASHPID" != "$__pk_main" ]; then trap - "$sig"; kill -s "$sig" "$BASHPID"; exit 1; fi; case "$cmd" in wait|"wait "*) eval "set -- ${cmd#wait}"; if [ $# -eq 0 ]; then live=1; else for p in "$@"; do kill -0 "$p" 2>/dev/null && live=1; done; fi; if [ -n "$live" ]; then eval "$cmd"; rc=$?; fi;; esac; wait; exit "$rc"; }\n'
-              'trap \'__pk_stop USR1 $? "$BASH_COMMAND"\' USR1\n'
-              'trap \'__pk_stop TERM $? "$BASH_COMMAND"\' TERM\n')
+TASK_SHELL = r'''__pk_main=$BASHPID
+__pk_nap() { if [ -n "${__pk_fd:-}" ] && [ -z "${__pk_in:-}" ]; then read -r -t 0.05 -u "$__pk_fd" __pk_x || :; else sleep 0.05 || :; fi; }
+__pk_live() { local s; kill -0 "$1" 2>/dev/null || return 1; { read -r s < "/proc/$1/stat"; } 2>/dev/null || return 0; s=${s##*) }; [ "${s%% *}" != Z ]; }
+__pk_wait() { local IFS=$' \t\n' p s=0 j=$'\n'$(trap '' USR1 TERM; jobs -p)$'\n'; for p; do if [[ $j == *$'\n'$p$'\n'* ]]; then while __pk_live "$p"; do __pk_nap; done; fi; builtin wait "$p" && s=0 || s=$?; done; return $s; }
+wait() { local IFS=$' \t\n' r; case " $* " in *" -"*|*%*) builtin wait "$@"; return;; esac; if [ $# -eq 0 ]; then __pk_w=$(jobs -p); __pk_all=1; else __pk_w="$*"; __pk_all=; fi; __pk_wait $__pk_w && r=0 || r=$?; __pk_w=; [ -z "$__pk_all" ] || r=0; return $r; }
+__pk_stop() { local IFS=$' \t\n' sig=$1 rc=$2; if [ "$BASHPID" != "$__pk_main" ]; then trap - "$sig"; kill -s "$sig" "$BASHPID"; exit 1; fi; __pk_in=1; if [ -n "${__pk_w:-}" ]; then __pk_wait $__pk_w && rc=0 || rc=$?; [ -z "$__pk_all" ] || rc=0; fi; __pk_wait $(jobs -p) || :; exit "$rc"; }
+trap '__pk_stop USR1 $?' USR1
+trap '__pk_stop TERM $?' TERM
+__pk_f=$(mktemp -u "${TMPDIR:-/tmp}/.pk_nap.XXXXXX" 2>/dev/null) && mkfifo -m 600 "$__pk_f" 2>/dev/null && exec {__pk_fd}<>"$__pk_f"; rm -f "$__pk_f" 2>/dev/null
+'''
 
 def slot_readings(slot_ids, gpm, smi):
     """One utilisation per expected slot: GPM's where it is a finite number, else nvidia-smi's for that slot, else None (not read).
@@ -69,15 +88,24 @@ def slot_readings(slot_ids, gpm, smi):
     return out
 
 POOL_WORKER = r"""#!/usr/bin/env python3
-# pool worker: runs commands i, i+parallel, i+2*parallel, ... of a command file; one line per command in the log: index rc seconds
-import subprocess, sys, time
+# pool worker: runs commands i, i+parallel, i+2*parallel, ... of a command file; one line per command in the log: index rc seconds,
+# and ' interrupted' when the checkpoint signal (SIGUSR1) or SIGTERM came while it ran. The signal reaches the worker's whole process
+# group, its running command too: the worker then starts nothing more, waits for that command and records its status (a worker
+# that died of the signal at once let the launcher return while its command was still saving).
+import signal, subprocess, sys, time
 cmdf, w, par, logf = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 cmds = [l.rstrip('\n') for l in open(cmdf) if l.strip() and not l.startswith('#')]
+stop = []
+def halt(sig, frame):
+    stop.append(sig)   # a plain flag: no lock and no I/O in a signal handler
+signal.signal(signal.SIGUSR1, halt); signal.signal(signal.SIGTERM, halt)
 with open(logf, 'a') as log, open(logf + '.err', 'a') as err:
     for i in range(w, len(cmds), par):
-        t0 = time.time()
+        if stop:
+            break
+        t0 = time.time(); n = len(stop)
         rc = subprocess.call(cmds[i], shell=True, stdout=subprocess.DEVNULL, stderr=err)
-        log.write(f"{i} {rc} {time.time()-t0:.3f}\n"); log.flush()
+        log.write(f"{i} {rc} {time.time()-t0:.3f}" + (" interrupted" if len(stop) > n else "") + "\n"); log.flush()
 """
 
 def parse_cores(spec):
@@ -416,21 +444,33 @@ def main():
             start=l['start_iso'],end=now(),wall_s=round(time.time()-l['start'],3),exit=rc,utime_s=0.0,stime_s=0.0,maxrss_kb=0,
             stdout=f"{l['name']}.out",stderr=f"{l['name']}.err",reaped_in_signal_handler=True))
     stop.set(); wall=time.time()-t0
+    usr1=receipt['interrupted'] is not None and receipt['interrupted'].get('signal')==int(signal.SIGUSR1)
     receipt['pools']=[]
     for pl in pools:
-        done=0; failed=0; secs=0.0
+        # a worker's log: 'index status seconds' per command it ran, and ' interrupted' when the checkpoint signal or SIGTERM came while
+        # the command ran. The commands not finished, the interrupted ones and those never started, go to the pool's resume
+        # file in file order, for the next segment; an interrupted command's status is recorded, not judged.
+        done=0; failed=0; secs=0.0; cut={}; seen=set()
         for w in range(pl['parallel']):
             lf=os.path.join(args.receipt_dir,f"{pl['name']}-w{w}.pool.log")
             if os.path.exists(lf):
                 for line in open(lf):
                     parts=line.split()
-                    if len(parts)>=3:
-                        done+=1; failed+= (parts[1]!='0'); secs+=float(parts[2])
-        receipt['pools'].append(dict(name=pl['name'],commands=len(pl['_cmds']),parallel=pl['parallel'],threads=pl['threads'],cores=pl['_cores'],completed=done,failed=failed,command_seconds=round(secs,3)))
+                    if len(parts)>=3 and parts[0].isdigit():
+                        i=int(parts[0]); seen.add(i); secs+=float(parts[2])
+                        if parts[3:4]==['interrupted']: cut[i]=int(parts[1]) if parts[1].lstrip('-').isdigit() else parts[1]
+                        else: done+=1; failed+= (parts[1]!='0')
+        left=[i for i in range(len(pl['_cmds'])) if i not in seen]
+        resume=sorted(set(cut)|set(left)); rf=None
+        if resume:
+            rf=f"{pl['name']}.resume.cmds"
+            with open(os.path.join(args.receipt_dir,rf),'w') as fh: fh.write(''.join(pl['_cmds'][i]+'\n' for i in resume))
+        receipt['pools'].append(dict(name=pl['name'],commands=len(pl['_cmds']),parallel=pl['parallel'],threads=pl['threads'],cores=pl['_cores'],completed=done,failed=failed,
+                                     interrupted=len(cut),interrupted_exits={str(i):cut[i] for i in sorted(cut)},not_started=len(left),resume_file=rf,command_seconds=round(secs,3)))
     # A SIGUSR1 interruption after which every task exited 0 is the contract working (checkpoint, exit 0, resume next segment),
     # not a failure: the receipt says checkpoint_segment=True and all_ok stays True. SIGTERM, or any non-zero exit, is a failure.
-    exits_ok=all(t['exit']==0 for t in receipt['tasks']) and all(p['failed']==0 and p['completed']==p['commands'] for p in receipt['pools'])
-    usr1=receipt['interrupted'] is not None and receipt['interrupted'].get('signal')==int(signal.SIGUSR1)
+    # A pool under SIGUSR1 counts when no command it finished had failed: the rest is in its resume file.
+    exits_ok=all(t['exit']==0 for t in receipt['tasks']) and all(p['failed']==0 and (p['completed']==p['commands'] or usr1) for p in receipt['pools'])
     receipt.update(ended=now(),wall_s=round(wall,3),gpu_slot_hours_held=round(len(slots)*wall/3600,6),cpu_seconds=round(sum(t['utime_s']+t['stime_s'] for t in receipt['tasks']),3),
                    checkpoint_segment=bool(usr1 and exits_ok and not receipt['launch_error']), all_ok=exits_ok and (receipt['interrupted'] is None or usr1) and not receipt['launch_error'])
     # per-GPU activity summary: interval-averaged GPM where available (the truthful one), else nvidia-smi's instantaneous samples
@@ -457,7 +497,7 @@ def main():
         f.write('| task | kind | slot | cores | wall s | exit | cpu s | max RSS MB |\n|---|---|---|---|---:|---:|---:|---:|\n')
         for t in sorted(receipt['tasks'],key=lambda x:(x['kind'],x['name'])):
             f.write(f"| {t['name']} | {t['kind']} | {t['slot']} | {','.join(map(str,t['cores']))} | {t['wall_s']} | {t['exit']} | {round(t['utime_s']+t['stime_s'],1)} | {round(t['maxrss_kb']/1024,1)} |\n")
-        for p in receipt['pools']: f.write(f"\npool {p['name']}: {p['completed']}/{p['commands']} commands done, {p['failed']} failed, {p['parallel']} workers x {p['threads']} threads on cores {','.join(map(str,p['cores']))}, {p['command_seconds']} command-seconds\n")
+        for p in receipt['pools']: f.write(f"\npool {p['name']}: {p['completed']}/{p['commands']} commands done, {p['failed']} failed, {p['parallel']} workers x {p['threads']} threads on cores {','.join(map(str,p['cores']))}, {p['command_seconds']} command-seconds" + (f"; {p['interrupted']} interrupted (exits {p['interrupted_exits']}) and {p['not_started']} not started, kept for the next segment in {p['resume_file']}" if p.get('resume_file') else '') + "\n")
         if receipt.get('gpu_summary'):
             f.write(f"\nGPU activity per slot ({receipt['gpu_sampler']}, means over the job; gpu_util = share of time a kernel ran, sm_active = share of SMs busy (Active SM), busy = share of samples with gpu_util >= 5%):\n\n| slot | samples | gpu_util % | sm_active % | occupancy % | tensor % | dram % | busy | peak mem MiB |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             for slot,g in sorted(receipt['gpu_summary'].items()):

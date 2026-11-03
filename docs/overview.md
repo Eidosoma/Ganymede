@@ -16,7 +16,7 @@ Ganymede is a set of small tools and a way of working for running many AI agents
 
 **Caps.** `caps.json`: one GPU-hour cap per lane tag, required: no caps file, no submission. The caps usually sum to the allocation; a `pool` entry can hold unassigned hours. See [budget-and-accounting.md](budget-and-accounting.md).
 
-**Worst case.** What a submission can cost at most: its time limit times the GPUs it holds, times the array tasks and nodes. The budget check and the review hold both use it.
+**Worst case.** What a submission can cost at most: its time limit, as Slurm rounds it (up to whole minutes), times the GPUs it holds, times the array tasks and nodes. The budget check and the review hold both use it.
 
 **Fleet ceiling.** The most nodes the account may have in flight at once (`MAX_NODES_IN_FLIGHT`). Slurm may not enforce a node limit on a project account; the wrapper does. A pending array counts the elements its throttle lets run at once.
 
