@@ -143,11 +143,26 @@ def raw_rows(out):
     return rows
 
 
+def link_on_path(p):
+    """The first folder on p's path, inside the checkout, that is a symbolic link; None if there is none. (os.path.isdir follows
+    links: a folder replaced by a link to one outside would pass a check made with it, and the file out there would be written.)"""
+    d = os.path.dirname(p)
+    while d:
+        if os.path.islink(os.path.join(ROOT, d)):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+
 def work_state(paths, filemode):
-    """(mode, sha) of each working path, None if absent; 'DIR' if a folder sits there; 'BLOCKED' if a parent is a file."""
+    """(mode, sha) of each working path, None if absent; 'DIR' if a folder sits there; 'BLOCKED' if a parent is a file; 'LINKED' if
+    a folder on its path is a symbolic link."""
     res, regular = {}, []
     for p in paths:
         full = os.path.join(ROOT, p)
+        if link_on_path(p):
+            res[p] = 'LINKED'
+            continue
         parent, blocked = os.path.dirname(p), False
         while parent:
             fp = os.path.join(ROOT, parent)
@@ -186,7 +201,7 @@ def same_mode(a, b, filemode):
 
 
 def eq(a, b, filemode):
-    """The same (mode, sha) state? None = nothing there; 'DIR' and 'BLOCKED' equal nothing."""
+    """The same (mode, sha) state? None = nothing there; 'DIR', 'BLOCKED' and 'LINKED' equal nothing."""
     if a is None or b is None:
         return a is None and b is None
     if isinstance(a, str) or isinstance(b, str):
@@ -384,8 +399,9 @@ def one_round(rnd, dry, gitdir, filemode):
         else:
             i_ent = h_ent
         w = work[p]
-        if w in ('DIR', 'BLOCKED'):
-            conflicts.append(('a folder in the way' if w == 'DIR' else 'a file in the way of its folder') + ': ' + p)
+        if w in ('DIR', 'BLOCKED', 'LINKED'):
+            conflicts.append({'DIR': 'a folder in the way', 'BLOCKED': 'a file in the way of its folder',
+                              'LINKED': 'a symbolic link on its path (' + str(link_on_path(p)) + '), which may lead outside the checkout'}[w] + ': ' + p)
             continue
         w_h, w_o = eq(w, h_ent, filemode), eq(w, o_ent, filemode)
         i_h, i_o = eq(i_ent, h_ent, filemode), eq(i_ent, o_ent, filemode)
@@ -437,6 +453,9 @@ def one_round(rnd, dry, gitdir, filemode):
         for p in targets:
             full = os.path.join(ROOT, p)
             exp, loc = work[p], None
+            if link_on_path(p):
+                problems.append('a folder on its path became a symbolic link during the run, after the check: ' + p + ' (' + str(link_on_path(p)) + ')')
+                break
             if exp is not None:
                 try:
                     loc = move_aside(full, run_dir, p)
@@ -490,7 +509,10 @@ def one_round(rnd, dry, gitdir, filemode):
             with_lock_retry(gitdir, 'add', '--refresh', '--pathspec-from-file=-', '--pathspec-file-nul',
                             inp=('\0'.join(fresh) + '\0').encode(errors='surrogateescape'), env=dict(ENV, GIT_LITERAL_PATHSPECS='1'))
         except GitError as e:
-            say('NOTE: the stat information of the written files was not refreshed (' + str(e)[:160] + '); git status re-reads them')
+            if 'beyond a symbolic link' in str(e):   # a written path git will not follow: never a success
+                problems.append('git refused a written path as beyond a symbolic link: ' + str(e)[:160])
+            else:
+                say('NOTE: the stat information of the written files was not refreshed (' + str(e)[:160] + '); git status re-reads them')
     for p, loc, exp in kept:
         if not eq(state_at(loc, p, filemode), exp, filemode):
             problems.append('written after it was moved aside (a writer that had it open): ' + p + '; that write is kept at ' + loc)

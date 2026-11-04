@@ -1,5 +1,6 @@
 #!/bin/bash
 echo "$*" >> "$FAKE/scontrol_calls.txt"
 [ -e "$FAKE/scontrol_fail" ] && { echo "scontrol: error: Unable to contact slurm controller (connect failure)" >&2; exit 1; }   # tests: a failed call
+if [ "$1" = release ] && [ -n "${FLEET_RESERVATIONS_FILE:-}" ]; then n=$(grep -c "|$2|" "$FLEET_RESERVATIONS_FILE" 2>/dev/null); echo "$2 ${n:-0}" >> "$FAKE/release_saw_reservation.txt"; fi   # tests: its reservation on file when released?
 if [ "$1" = release ]; then awk -F'|' -v OFS='|' -v j="$2" '$2==j && $6=="JobHeldUser"{$6=(($5=="(null)" || $5=="") ? "None" : "Dependency")} {print}' "$FAKE/jobs.txt" > "$FAKE/jobs.tmp" && mv "$FAKE/jobs.tmp" "$FAKE/jobs.txt"; fi
 exit 0

@@ -217,7 +217,7 @@ def assign_cores(all_cores, slots, gpu_tasks, cpu_tasks, gpu_cores, numa, reserv
             if loc: pool=[c for c in free if c in loc]
         if not pool: pool=free
         take=pool[-want:] if want<=len(pool) else pool   # feeders take the HIGHEST cores of their pool; the low cores of each processor carry the OS, IRQs, the Slurm step, this launcher and the sidecars
-        if len(take)<want: raise SystemExit(f'not enough cores for GPU task {t["name"]}: want {want}, free {len(pool)}')
+        if len(take)<want: raise SystemExit(f'not enough cores for GPU task {t["name"]}: want {want}, free {len(pool)} of the {len(all_cores)} this launcher may use (its affinity, or --cores); fewer threads per task may fit')
         plan[('gpu',i)]=take; free=[c for c in free if c not in take]
     spare=list(reserved)                      # reserved cores: sidecars only, after every free core is taken
     for j,t in enumerate(cpu_tasks):
@@ -234,7 +234,35 @@ def assign_cores(all_cores, slots, gpu_tasks, cpu_tasks, gpu_cores, numa, reserv
     plan['free']=free
     return plan
 
+def check_names(gpu_tasks, cpu_tasks, pools):
+    """Every file a task or a pool writes in the receipt folder is named after it (<name>.out and .err; <pool>.cmds and .resume.cmds;
+    <pool>-w<N>.out, .err and .pool.log): the names must name files, and be distinct (two tasks named alike would
+    share one log, each overwriting the other, under a receipt that says all_ok). Returns the problems found."""
+    problems, seen = [], {}
+    def use(name, what):
+        if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
+            problems.append(f'{what}: {name!r} cannot name its files'); return
+        if name in seen: problems.append(f'{what} has the name {name!r} of {seen[name]}'); return
+        seen[name] = what
+    for i, t in enumerate(gpu_tasks): use(t.get('name'), f'gpu task {i + 1}')
+    for i, t in enumerate(cpu_tasks): use(t.get('name'), f'cpu task {i + 1}')
+    for i, p in enumerate(pools):
+        use(p.get('name'), f'cpu pool {i + 1}')
+        try: n = int(p.get('parallel', 1))
+        except (TypeError, ValueError): n = 1
+        for w in range(max(1, n)): use(f"{p.get('name')}-w{w}", f"cpu pool {p.get('name')!r} worker {w}")
+    return problems
+
+
 def main():
+    if sys.argv[1:2] == ['--check-names']:   # the submit wrapper's check of a spec's names, before an allocation is asked for
+        bad = 0
+        for f in sys.argv[2:]:
+            try: s = json.load(open(f))
+            except (OSError, ValueError) as e: print(f'REFUSED: {f}: {e}', file=sys.stderr); bad = 1; continue
+            for pr in check_names(s.get('gpu_tasks', []), s.get('cpu_tasks', []), s.get('cpu_pools', [])):
+                print(f'REFUSED: {f}: task names: {pr}', file=sys.stderr); bad = 1
+        sys.exit(2 if bad else 0)
     ap=argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--spec', required=True); ap.add_argument('--receipt-dir', required=True)
     ap.add_argument('--mode', default='auto', choices=['auto','slurm','local','fake','cpu'], help="cpu: no GPU slots; the spec must have no gpu_tasks")
@@ -253,6 +281,8 @@ def main():
     ap.add_argument('--idle-gpu-util', type=float, default=1.0, help='the utilisation (percent) at or above which a slot counts as active for the idle watchdog (default 1)')
     args=ap.parse_args()
     spec=json.load(open(args.spec)); gpu_tasks=spec.get('gpu_tasks',[]); cpu_tasks=spec.get('cpu_tasks',[]); pools=spec.get('cpu_pools',[])
+    bad_names=check_names(gpu_tasks,cpu_tasks,pools)
+    if bad_names: print('REFUSED: task names: ' + '; '.join(bad_names), file=sys.stderr); sys.exit(2)
     for pl in pools:
         pl.setdefault('threads',1); pl.setdefault('parallel',1)
         try: pl['_cmds']=[l.rstrip('\n') for l in open(os.path.join(pl.get('cwd') or os.getcwd(), pl['cmd_file'])) if l.strip() and not l.startswith('#')]
@@ -317,11 +347,13 @@ def main():
             cmd=['taskset','-c',','.join(map(str,c)),'nice','-n',str(max(args.nice,args.sidecar_nice)),'bash','-lc',script]
             launches.append(dict(kind='pool',name=f"{pl['name']}-w{w}",slot='',cores=c,cmd=f"pool {pl['name']} worker {w} of {pl['parallel']} over {len(pl['_cmds'])} commands",cwd=pl.get('cwd') or os.getcwd(),env=env,argv=cmd))
     missing=[f"{l['name']} ({l['cwd']})" for l in launches if not os.path.isdir(l['cwd'])]
+    if args.dry_run:   # the plan first, also when the launch would be refused
+        for l in launches: print(f"[{l['kind']}] {l['name']}: slot={l['slot']!r} cores={l['cores']} cwd={l['cwd']} cmd={l['cmd']}")
+        print('free cores:',plan['free'])
+        if missing: print('the launch would be REFUSED: task folder(s) missing: ' + '; '.join(missing), file=sys.stderr); sys.exit(2)
+        return
     if missing:   # every task's folder is checked before anything starts (a later task's missing folder used to leave the earlier ones running, with no receipt)
         print('REFUSED: task folder(s) missing: ' + '; '.join(missing), file=sys.stderr); sys.exit(2)
-    if args.dry_run:
-        for l in launches: print(f"[{l['kind']}] {l['name']}: slot={l['slot']!r} cores={l['cores']} cwd={l['cwd']} cmd={l['cmd']}")
-        print('free cores:',plan['free']); return
     procs={}; receipt['launch_error']=None
     for k,l in enumerate(launches):
         try:

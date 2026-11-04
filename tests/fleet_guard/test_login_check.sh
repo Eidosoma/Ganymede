@@ -50,10 +50,14 @@ case "\$*" in
 esac
 EOF
 chmod +x "$F/bin/nvidia-smi"
-gr(){ PATH="$F/bin:$PATH" python3 "$LC" --gpu-gib "$1" --json 2>/dev/null | python3 -c 'import json,sys; print(" | ".join(json.load(sys.stdin)["reasons"]))'; }
-R10=$(gr 10); R4=$(gr 4); rm -rf "${F:?}"
+# the tool's whole reading is kept, and printed when a check fails: one failure seen elsewhere (4 November) did not recur, and had
+# left nothing to read
+gr(){ PATH="$F/bin:$PATH" python3 "$LC" --gpu-gib "$1" --json > "$F/r$1.json" 2> "$F/r$1.err"; python3 -c 'import json,sys; print(" | ".join(json.load(open(sys.argv[1]))["reasons"]))' "$F/r$1.json" 2>/dev/null; }
+F0=$FAILS; R10=$(gr 10); R4=$(gr 4)
 check "10 GiB more with 10 GiB held and others on the card: over the 16 GiB rule, named" 'echo "$R10" | grep -q "you would hold 20.0 GiB (10.0 already, 10.0 more)"'
 check "4 GiB more (14 GiB in all): no objection from the GPU rule" '! echo "$R4" | grep -q "you would hold"'
+if [ "$FAILS" != "$F0" ]; then for n in 10 4; do echo "      | the tool's reading with --gpu-gib $n:"; sed 's/^/      |   /' "$F/r$n.json" "$F/r$n.err"; done; fi
+rm -rf "${F:?}"
 
 echo; echo "LOGIN CHECK RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ]

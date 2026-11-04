@@ -104,6 +104,12 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **A copy keeps the sender's clock.** Found while writing the copy-back helper's first tests, and reproduced: its manifest took the files newer than the list, but rsync -a gives every file the remote's modification time, so the files it had just pulled were older than the list and were left out, and the manifest held one line, its own. *Rule:* a manifest names the files it is about, never the files that look new.
 
+**The environment is part of the request.** Found in a fourth review, and reproduced: `sbatch` reads options from `SBATCH_*` variables, so an inherited `SBATCH_ARRAY_INX` turned a one-node job into an unthrottled array of a hundred after the wrapper had priced and reserved one. *Rule:* what a guard reckons must be all the scheduler receives; clear what the tools would also read.
+
+**Record, then release.** Found in the same review, and reproduced: a job that could start went in unheld and was recorded after; when the record failed, the job ran with no reservation and the wrapper reported a failure. *Rule:* submit held, write everything that accounts for the job, then release it.
+
+**Absent is not ended.** Found in the same review, by fault injection: the dispatcher took a held job missing from one reading of the queue for gone and dropped it, and nothing would ever release it. *Rule:* remove a record on evidence (released, ended in accounting), never on silence.
+
 ## People and agents
 
 **A word is not a habit.** An approval given for one job was never meant for the next one, and a raised cap was never meant as an approval. *Rule:* one word per job, recorded verbatim with the time it was first seen, spent by the submit ([operating-model.md](operating-model.md)).

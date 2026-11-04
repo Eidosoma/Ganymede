@@ -13,6 +13,15 @@ def main():
     nv.nvmlInit(); n = nv.nvmlDeviceGetCount()
     idx = [int(x) for x in a.gpus.split(",") if x.strip()] or list(range(n))
     hs = {i: nv.nvmlDeviceGetHandleByIndex(i) for i in idx}
+    def ident(h):   # who each GPU is, so a reading can be matched to a task's GPU by UUID, not by its place
+        out = {}
+        for key, get in (('uuid', lambda: nv.nvmlDeviceGetUUID(h)), ('pci_bus_id', lambda: nv.nvmlDeviceGetPciInfo(h).busId), ('name', lambda: nv.nvmlDeviceGetName(h))):
+            try:
+                v = get(); out[key] = v.decode() if isinstance(v, bytes) else str(v)
+            except Exception:
+                out[key] = None
+        return out
+    devices = {str(i): ident(hs[i]) for i in idx}
     s1 = {i: nv.nvmlGpmSampleAlloc() for i in idx}; s2 = {i: nv.nvmlGpmSampleAlloc() for i in idx}
     for i in idx: nv.nvmlGpmSampleGet(hs[i], s1[i])
     out = open(a.out, "w") if a.out else sys.stdout; acc = {i: {k: [] for k in list(METRICS.values()) + ["smi_util"]} for i in idx}
@@ -32,7 +41,7 @@ def main():
                 if v is not None: acc[i][k].append(v)
         out.write(json.dumps(row) + "\n"); out.flush()
     summary = {str(i): {k: (round(sum(v) / len(v), 2) if v else None) for k, v in acc[i].items()} for i in idx}
-    summary_line = {"summary": summary, "seconds": round(time.time() - t0, 1), "samples": {str(i): len(acc[i]["smi_util"]) for i in idx}}
+    summary_line = {"summary": summary, "seconds": round(time.time() - t0, 1), "samples": {str(i): len(acc[i]["smi_util"]) for i in idx}, "devices": devices}
     out.write(json.dumps(summary_line) + "\n"); out.flush()
     if a.out: print(json.dumps(summary_line))
 if __name__ == "__main__": main()

@@ -1,7 +1,8 @@
 #!/bin/bash
 # tests/fleet_guard/test_ffscoped.sh FFSCOPED_PY: the scoped fast-forward (git/ffscoped.py) on
 # throwaway repositories: a bare "origin", a "shared" checkout cloned at the base, an "outside" clone that pushes ahead (adds,
-# edits, a deletion that empties a folder, a mode change, a retargeted and a new symlink, a path with spaces, a non-ASCII name).
+# edits, a deletion that empties a folder, a mode change, a retargeted and a new symlink, a path with spaces, a non-ASCII name), and a
+# local folder replaced by a symbolic link to one outside the checkout (F19, 1.3.23).
 # Nothing here touches the real checkout or GitHub: FF_ROOT always points into the temp folder and the remote is a local path.
 FF="$(readlink -f "${1:-}")"; [ -n "$FF" ] && [ -f "$FF" ] || { echo "usage: test_ffscoped.sh <ffscoped.py>"; exit 2; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/ff_test.XXXXXX"); trap 'rm -rf "$T"' EXIT
@@ -144,6 +145,12 @@ check "after a clean run, main's versions of the replaced and removed files are 
 O1="$SH/.git/ffscoped-backup/20000101T000000Z-1-1"; O2="$SH/.git/ffscoped-backup/20000101T000000Z-2-1"
 cp -r "$BK" "$O1" 2>/dev/null; cp -r "$BK" "$O2" 2>/dev/null && printf 'late\n' >> "$O2/files/a.txt"; RC=$(ff python3 "$FF")
 check "the next run (nothing to do): the old unchanged backup removed, the old changed one kept and named, the recent one kept" '[ "$RC" = 0 ] && [ ! -e "$O1" ] && [ -e "$O2" ] && grep -q "kept: a file in it differs" "$T/ff.out" && [ -d "$BK" ]'
+
+echo "F19. origin changes lane/x.txt and the local lane folder is a symbolic link to a folder outside the checkout holding the same file (a fourth review): refused, nothing written"
+mk; (cd "$W/seed" && printf 'x2\n' > lane/x.txt && git commit -q -am outside3 && git push -q origin main) > /dev/null 2>&1
+mkdir -p "$T/outside19" && cp "$SH/lane/x.txt" "$T/outside19/x.txt" && rm -r "$SH/lane" && ln -s "$T/outside19" "$SH/lane"
+H19=$(git -C "$SH" rev-parse main); RC=$(ff python3 "$FF")
+check "exit 5, the link named; the file outside unchanged, main where it was" '[ "$RC" = 5 ] && grep -q "a symbolic link on its path (lane), which may lead outside the checkout: lane/x.txt" "$T/ff.out" && [ "$(cat "$T/outside19/x.txt")" = x1 ] && [ "$(git -C "$SH" rev-parse main)" = "$H19" ]'
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ]

@@ -18,6 +18,14 @@
 # is passed over and holds up nobody behind it.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; JDIR="$(cd "$HERE/.." && pwd)"
+# The scheduler's options come from here alone, and the guards read the queue as it is: sbatch takes options
+# from SBATCH_* variables and from the SLURM_* ones a job's own environment carries (SLURM_NTASKS, SLURM_CPUS_PER_TASK, ...), and
+# squeue, sacct and scontrol take SQUEUE_*, SACCT_* and SCONTROL_* filters, SLURM_CLUSTERS and SLURM_TIME_FORMAT. Inherited from the
+# caller, they would change what is submitted after its cost, nodes and guards were reckoned (SBATCH_ARRAY_INX=0-99 would make a one-node
+# job an unthrottled array of 100), or what the guards see. They are dropped for everything started from here, and named. The names: Slurm
+# 25.05's src/sbatch/opt.c and src/squeue/opts.c (sacct and scontrol read only the prefixed ones and SLURM_CLUSTERS).
+DROPPED=$(compgen -e | grep -E '^(SBATCH|SQUEUE|SACCT|SCONTROL)_|^SLURM_(CLUSTERS|CONTAINER|CONTAINER_ID|CPUS_PER_TASK|DIST_PLANESIZE|DISTRIBUTION|EXPORT_ENV|HINT|MEM_BIND|MEM_BIND_SORT|MEM_BIND_VERBOSE|NPROCS|NTASKS|NTASKS_PER_CORE|NTASKS_PER_GPU|NTASKS_PER_NODE|NTASKS_PER_SOCKET|NTASKS_PER_TRES|THREADS_PER_CORE|TIME_FORMAT)$' | sort | tr '\n' ' ') || true
+for v in $DROPPED; do unset "$v"; done
 SITE=local; DEPARTING=""; QUIET=0
 while [ $# -gt 0 ]; do case "$1" in --site) SITE="$2"; shift 2;; --departing) DEPARTING="$2"; shift 2;; --quiet) QUIET=1; shift;; *) shift;; esac; done
 . "$HERE/site.$SITE.env"
@@ -61,10 +69,63 @@ while IFS='|' read -r KIND JID N NAME; do
     else say "release of $JID failed; left held"; break; fi
   else break; fi                                               # strict first in first out
 done <<< "$QV"
-# keep the list short: drop entries whose job is no longer pending with a hold (it was released, cancelled, or has run). Safe under
-# the lock, and only after a successful reading of the queue: a held job never leaves the queue by itself.
-TMPQ="$QFILE.tmp.$$"
-awk -F'|' -v snap="$SNAP" -v rel="$RELIDS" 'BEGIN{n=split(snap,L,"\n"); for(i=1;i<=n;i++){split(L[i],f,"|"); if(f[3]=="PD" && f[5] ~ /JobHeldUser/) held[f[6]]=1}; m=split(rel,R," "); for(i=1;i<=m;i++) delete held[R[i]]} ($2 in held)' "$QFILE" > "$TMPQ" 2>/dev/null && mv "$TMPQ" "$QFILE" || rm -f "$TMPQ"
+# keep the list short, on evidence: an entry goes when this reading shows its job no longer pending with a
+# hold (released, running, cancelled or ended), or when accounting shows the job ended. A job this reading does not show is kept: a
+# held job never leaves the queue by itself, and a reading can miss one (the reservations allow for that); an entry dropped on one
+# such reading would leave its job held with nobody to release it. Safe under the lock, and only after a successful reading of the queue.
+PRUNED=$(FD_SNAP="$SNAP" python3 - "$QFILE" "$RELIDS" <<'PY'
+import os, subprocess, sys
+qfile, rel = sys.argv[1], set(sys.argv[2].split())
+seen, held = set(), set()
+for line in os.environ.get('FD_SNAP', '').splitlines():   # %A|%D|%t|%E|%r|%F|%j|%i
+    f = line.split('|')
+    if len(f) >= 6:
+        seen.add(f[5])
+        if f[2] == 'PD' and 'JobHeldUser' in f[4]:
+            held.add(f[5])
+keep, absent, notes = [], [], []
+for line in open(qfile).read().splitlines():
+    j = (line.split('|') + ['', ''])[1]
+    if not j.isdigit():
+        notes.append('an unreadable line dropped: ' + line[:80])
+    elif j in rel:
+        pass                                    # released by this pass
+    elif j in held:
+        keep.append(line)
+    elif j in seen:
+        notes.append(j + ' is in the queue and no longer held: dropped')
+    else:
+        absent.append((j, line))
+if absent:
+    ended, acct = {}, None
+    try:
+        r = subprocess.run(['sacct', '-X', '-n', '-P', '-j', ','.join(j for j, _ in absent), '-o', 'JobID,State'],
+                           capture_output=True, text=True, timeout=120, env=dict(os.environ, TZ='UTC'))
+        acct = r.stdout if r.returncode == 0 else None
+    except Exception:
+        acct = None
+    if acct is not None:
+        END = ('COMPLETED', 'CANCELLED', 'FAILED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED', 'OUT_OF_MEMORY', 'BOOT_FAIL', 'DEADLINE', 'REVOKED')
+        states = {}
+        for line in acct.splitlines():
+            p = line.split('|')
+            if len(p) >= 2 and p[0]:
+                states.setdefault(p[0].split('_')[0].split('.')[0], []).append((p[1].split() or [''])[0])
+        ended = {j: s[0] for j, s in states.items() if s and all(x in END for x in s)}
+    for j, line in absent:
+        if j in ended:
+            notes.append(j + ' is not in the queue and ended in accounting (' + ended[j] + '): dropped')
+        else:
+            keep.append(line)
+            notes.append(j + ' is not in this reading of the queue' + ('' if acct is not None else ', and accounting could not be read') + ': kept')
+tmp = qfile + '.tmp.' + str(os.getpid())
+with open(tmp, 'w') as f:
+    f.write(''.join(x + '\n' for x in keep))
+os.replace(tmp, qfile)
+print('\n'.join(notes))
+PY
+) || PRUNED="the fleet queue could not be tidied this pass: every entry kept"
+[ -z "$PRUNED" ] || say "$PRUNED"
 WAITDEP=$(printf '%s\n' "$QV" | awk '/^D\|/{c++} END{print c+0}')
 say "dispatch pass done: $RELEASED released, $INFLIGHT node(s) in flight, limit $MAX_NODES_IN_FLIGHT, $(wc -l < "$QFILE" 2>/dev/null || echo 0) still waiting ($WAITDEP of them for their predecessors)"
 exit 0

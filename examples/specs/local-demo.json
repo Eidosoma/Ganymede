@@ -1,0 +1,23 @@
+{
+ "job": "alpha-demo",
+ "_note": "A first run on any machine with two cores and no GPU: two GPU tasks on invented GPU slots (fake mode) and a CPU sidecar, each printing where the launcher put it, then exiting after two seconds. The tasks run in the folder you start from (no cwd). Run, from the repository: python3 pack_node.py --spec examples/specs/local-demo.json --receipt-dir /tmp/ganymede-demo --mode fake --fake-gpus 2 --reserve-cores 0; then read /tmp/ganymede-demo/receipt.md.",
+ "gpu_tasks": [
+  {
+   "name": "train-a",
+   "threads": 1,
+   "cmd": "python3 -c \"import os, time; print('training', os.environ['PACK_TASK'], 'in slot', repr(os.environ['PACK_SLOT']), 'on cores', os.environ['PACK_CORES'], flush=True); time.sleep(2); print('done', flush=True)\""
+  },
+  {
+   "name": "train-b",
+   "threads": 1,
+   "cmd": "python3 -c \"import os, time; print('training', os.environ['PACK_TASK'], 'in slot', repr(os.environ['PACK_SLOT']), 'on cores', os.environ['PACK_CORES'], flush=True); time.sleep(2); print('done', flush=True)\""
+  }
+ ],
+ "cpu_tasks": [
+  {
+   "name": "evaluate",
+   "threads": 1,
+   "cmd": "python3 -c \"import os, time; print('evaluating', os.environ['PACK_TASK'], 'in slot', repr(os.environ['PACK_SLOT']), 'on cores', os.environ['PACK_CORES'], flush=True); time.sleep(2); print('done', flush=True)\""
+  }
+ ]
+}

@@ -31,6 +31,14 @@
 #                 dispatcher releases it in its turn once they have ended and its nodes fit
 #   one at a time submissions take a fleet-wide lock (an atomic mkdir on the shared filesystem), always; its holder refreshes it while
 #                 it works, and a lock nobody has refreshed for FLEET_LOCK_STALE_S seconds (180) belongs to a dead holder and is taken over
+#   records first every job is submitted held; its submission record, its reservation and, when it waits, its fleet queue entry are
+#                 written, and only then is a job that may start released. A job whose records cannot be written stays held (exit 7,
+#                 ACCEPTED AND HELD, NOT RECORDED): it exists, cannot spend, and must not be submitted again. The state files must
+#                 take a line before anything is submitted (exit 4)
+#   environment   the request is the wrapper's alone: SBATCH_*, the SLURM_* variables sbatch reads as options (those a job's own
+#                 environment carries: SLURM_NTASKS, ...), and squeue's, sacct's and scontrol's (SQUEUE_*, SACCT_*, SCONTROL_*,
+#                 SLURM_CLUSTERS, SLURM_TIME_FORMAT) are left out of everything it starts, and named
+#   task names    the spec's task names name the receipt's files: distinct and usable, checked before submission (exit 2)
 # --nodes N: a multi-node job (N whole nodes); the same spec runs on every node under srun, one launcher per node, with SLURM_NNODES,
 #           SLURM_NODEID and SLURM_JOB_NODELIST available to the tasks for rendezvous (NCCL). Charged N x GPUS_PER_NODE an hour.
 # --comment: passed to sbatch --comment (site job overrides; on JSC systems the documented keys include CUDA_MPS=1,
@@ -41,9 +49,19 @@
 # CPU-only specs (no gpu_tasks): allowed where the site has CPU_PARTITION (shared cores, no gres, --cores N); elsewhere refused unless
 # --force-node --reason, which holds (and is charged for) a whole node.
 # Exit codes: 0 submitted or queued; 1 usage or a missing spec; 2 refused spec or options; 3 budget; 4 ceiling, lock or unreadable queue;
-# 5 duplicate name; 6 rate guard; anything else is sbatch's own failure.
+# 5 duplicate name; 6 rate guard; 7 accepted and held, its records not written (the job exists: never submit it again); anything else
+# is sbatch's own failure.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; JDIR="$(cd "$HERE/.." && pwd)"
+# The scheduler's options come from here alone, and the guards read the queue as it is: sbatch takes options
+# from SBATCH_* variables and from the SLURM_* ones a job's own environment carries (SLURM_NTASKS, SLURM_CPUS_PER_TASK, ...), and
+# squeue, sacct and scontrol take SQUEUE_*, SACCT_* and SCONTROL_* filters, SLURM_CLUSTERS and SLURM_TIME_FORMAT. Inherited from the
+# caller, they would change what is submitted after its cost, nodes and guards were reckoned (SBATCH_ARRAY_INX=0-99 would make a one-node
+# job an unthrottled array of 100), or what the guards see. They are dropped for everything started from here, and named. The names: Slurm
+# 25.05's src/sbatch/opt.c and src/squeue/opts.c (sacct and scontrol read only the prefixed ones and SLURM_CLUSTERS).
+DROPPED=$(compgen -e | grep -E '^(SBATCH|SQUEUE|SACCT|SCONTROL)_|^SLURM_(CLUSTERS|CONTAINER|CONTAINER_ID|CPUS_PER_TASK|DIST_PLANESIZE|DISTRIBUTION|EXPORT_ENV|HINT|MEM_BIND|MEM_BIND_SORT|MEM_BIND_VERBOSE|NPROCS|NTASKS|NTASKS_PER_CORE|NTASKS_PER_GPU|NTASKS_PER_NODE|NTASKS_PER_SOCKET|NTASKS_PER_TRES|THREADS_PER_CORE|TIME_FORMAT)$' | sort | tr '\n' ' ') || true
+for v in $DROPPED; do unset "$v"; done
+[ -z "$DROPPED" ] || echo "NOTE: left out of the submission and of the guards' readings (the wrapper's options are the whole request): $DROPPED" >&2
 SITE=local; DEVEL=0; TIME=""; ARRAY=""; SPEC_DIR=""; NAME=""; PACK_ARGS=""; CPU_ONLY=0; CORES=""; FORCE_NODE=0; REASON=""; AFTER=""; AFTERANY=""; LOW=0; HOLD=0; OVERCAP=0; NODES=1; COMMENT=""; ALLOW_SAME=0
 while [ $# -gt 0 ]; do case "$1" in
   --site) SITE="$2"; shift 2;; --devel) DEVEL=1; shift;; --time) TIME="$2"; shift 2;; --array) ARRAY="$2"; shift 2;;
@@ -61,6 +79,10 @@ SPEC="$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")"
 [ -n "$SPEC_DIR" ] && SPEC_DIR="$(cd "$SPEC_DIR" && pwd)"
 NAME="${NAME:-$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('job','node'))" "$SPEC")}"
 NGPU_TASKS=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1])).get('gpu_tasks',[])))" "$SPEC")
+# the task names name the receipt's files: distinct and usable, checked before an allocation is asked for
+[ -f "$JDIR/pack_node.py" ] || { echo "refused: the launcher $JDIR/pack_node.py is missing, so the job could not start; nothing was submitted" >&2; exit 2; }
+CHECK_SPECS=("$SPEC"); if [ -n "$SPEC_DIR" ]; then for f in "$SPEC_DIR"/node_*.json; do if [ -f "$f" ]; then CHECK_SPECS+=("$f"); fi; done; fi
+python3 "$JDIR/pack_node.py" --check-names "${CHECK_SPECS[@]}" || { echo "refused: the spec's task names (above); nothing was submitted" >&2; exit 2; }
 SPEC_THREADS=$(python3 -c "import json,sys;s=json.load(open(sys.argv[1]));print(sum(t.get('threads',1) for t in s.get('cpu_tasks',[])))" "$SPEC")
 if [ "$NGPU_TASKS" = 0 ] && [ $CPU_ONLY = 0 ] && [ $FORCE_NODE = 0 ]; then echo "refused: the spec has no gpu_tasks. Use --cpu-only (shared cores, where the site allows it) or --force-node --reason (a whole node, charged as such)."; exit 2; fi
 if [ $CPU_ONLY = 1 ] && [ "$NGPU_TASKS" != 0 ]; then echo "refused: --cpu-only with gpu_tasks in the spec"; exit 2; fi
@@ -109,6 +131,11 @@ GUARD_QUEUED=0; CHAINED=0; WAITING=0; WANT="$NODES"
 QFILE="${FLEET_QUEUE_FILE:-$JDIR/receipts/FLEET_QUEUE.log}"; LOCK="${FLEET_LOCK_DIR:-$JDIR/receipts/.fleet.lock}"
 RFILE="${FLEET_RESERVATIONS_FILE:-$JDIR/receipts/FLEET_RESERVATIONS.log}"; LOCKED=0
 SFILE="${FLEET_SUBMISSIONS_FILE:-$JDIR/receipts/FLEET_SUBMISSIONS.log}"
+# the fleet's state files must take a line before anything is submitted: a reservation file whose folder does not exist would be
+# read as no reservations, and found unwritable only once the job was in the queue
+for F in "$SFILE" "$RFILE" "$QFILE"; do
+  { : >> "$F"; } 2>/dev/null || { echo "refused: the fleet's state file $F cannot be written (its folder is missing, or not writable); nothing was submitted" >&2; exit 4; }
+done
 if command -v squeue >/dev/null 2>&1; then
   # One submission at a time across the fleet: an atomic mkdir on the shared filesystem, taken whether or not the queue guards are
   # configured, because the budget check below depends on it. The holder refreshes the lock while it works (a cold budget read can
@@ -191,20 +218,41 @@ fi
 DEPS=""; [ -n "$AFTER" ] && DEPS="afterok:$AFTER"; [ -n "$AFTERANY" ] && DEPS="${DEPS:+$DEPS,}afterany:$AFTERANY"
 if [ -n "$DEPS" ]; then ARGS+=(--dependency="$DEPS"); fi
 if [ -n "$AFTER" ]; then ARGS+=(--kill-on-invalid-dep=yes); fi
+# Nothing starts before its records are written: every job is submitted held; its submission record, its
+# reservation and, when it waits, its place in the fleet queue are written; only then is a job that may start now released. A job
+# whose records cannot all be written stays held, with exit 7: it is accepted, it cannot spend, and it must not be submitted again.
+# (Recorded only after an unheld submission, a reservation that failed would leave a running job unreserved, and an error exit
+# would read as if nothing had been submitted.)
+[[ " ${ARGS[*]} " == *" --hold "* ]] || ARGS+=(--hold)
 echo "sbatch ${ARGS[*]} slurm/node.sbatch" >&2
 JOBID=$(sbatch --parsable "${ARGS[@]}" "$JDIR/slurm/node.sbatch")
 echo "$JOBID"
+J="${JOBID%%;*}"; NOW=$(date -u +%FT%TZ); MISSING=""; NEEDED=""
+rec(){ if ! { printf '%s\n' "$2" >> "$1"; } 2>/dev/null; then MISSING="${MISSING:+$MISSING; }$3 ($1)"; NEEDED="$NEEDED"$'\n'"  $1: $2"; fi; }
 # the fleet's record of every submission: one line each, written under the fleet lock and never pruned by the tooling, for the
 # rate guard (the controller forgets ended jobs) and for wait_jobs.py (an array's element set, which accounting may show in part).
 # UTC|job|name|lane|array (- for none)|tasks|nodes|time limit|dependency (- for none)
-echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$LANE|${ARRAY:--}|$NTASKS|$NODES|$TIME|${DEPS:--}" >> "$SFILE" || echo "WARNING: the submission record $SFILE could not be written; job ${JOBID%%;*} is submitted" >&2
+rec "$SFILE" "$NOW|$J|$NAME|$LANE|${ARRAY:--}|$NTASKS|$NODES|$TIME|${DEPS:--}" "the submission record"
 # reserve the job's worst case, still inside the lock, until the queue or accounting shows the job (budget.py drops it then)
 # the reservation also carries the nodes this job uses at once, whether it was submitted held or chained (it then cannot start by
 # itself), its task count, and an empty field for when the queue last showed it (the budget check fills it in)
 HELDNOW=0; { [ $HOLD = 1 ] || [ $GUARD_QUEUED = 1 ] || [ -n "$DEPS" ]; } && HELDNOW=1
-if [ "$EST" != 0 ]; then echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$LANE|$EST|$TIME|$NAME|$WANT|$HELDNOW|$NTASKS|" >> "$RFILE"; fi
+if [ "$EST" != 0 ]; then rec "$RFILE" "$NOW|$J|$LANE|$EST|$TIME|$NAME|$WANT|$HELDNOW|$NTASKS|" "the reservation"; fi
+if [ $GUARD_QUEUED = 1 ]; then rec "$QFILE" "$NOW|$J|$NAME|$WANT${DEPS:+|$DEPS}" "its fleet queue entry"; fi
+if [ -n "$MISSING" ]; then
+  echo "ACCEPTED AND HELD, NOT RECORDED: job $J is in the queue, held; it has not started and will not start by itself, because $MISSING could not be written. Do NOT submit it again. Tell the operator: with the cause fixed and the line(s) below written, the job can be released (scontrol release $J), or cancelled.$NEEDED" >&2
+  exit 7
+fi
+if [ $HOLD = 0 ] && [ $GUARD_QUEUED = 0 ]; then   # it may start now, and its records are written: the hold goes
+  if ! RERR=$(scontrol release "$J" 2>&1); then
+    if [ -n "${MAX_NODES_IN_FLIGHT:-}" ] && [ $LOCKED = 1 ] && { printf '%s\n' "$NOW|$J|$NAME|$WANT${DEPS:+|$DEPS}" >> "$QFILE"; } 2>/dev/null; then
+      echo "QUEUED BY THE FLEET GUARD: job $J is accepted and recorded, but its release failed (${RERR:0:160}), so it waits, held, in the fleet queue; the dispatcher releases it at its next pass (a job's end, or the next submission). Do NOT resubmit it." >&2
+    else
+      echo "ACCEPTED AND HELD: job $J is accepted and recorded, but its release failed (${RERR:0:160}); it starts once released (scontrol release $J). Do NOT resubmit it." >&2; exit 7
+    fi
+  fi
+fi
 if [ $GUARD_QUEUED = 1 ]; then
-  echo "$(date -u +%FT%TZ)|${JOBID%%;*}|$NAME|$WANT${DEPS:+|$DEPS}" >> "$QFILE"
   if [ $CHAINED = 1 ]; then
     # its predecessors may have ended already: one pass now, inside the lock, releases it if so and if its nodes fit; otherwise the
     # pass at a predecessor's end, or at any later submission, does

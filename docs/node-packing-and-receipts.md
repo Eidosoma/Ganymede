@@ -33,7 +33,9 @@ A node is never held with an idle GPU. The launcher refuses a spec with fewer GP
 | `cpu_pools[]` | many small commands: `cmd_file` holds one shell command per line (blank lines and `#` comments skipped); `parallel` workers, each pinned to `threads` cores, take the lines in stride order; every command's exit code and seconds are logged; `mem_gb` per worker; under the checkpoint signal a worker starts nothing more, waits for its running command, and the commands not finished go to `<pool>.resume.cmds` |
 | keys starting with `_` | ignored; use `_note` for a human-readable description |
 
-Examples are in [`examples/specs/`](../examples/specs/).
+Every task's and pool's `name` names its files in the receipt folder (`<name>.out` and `.err`; a pool's `<pool>.cmds`, `<pool>.resume.cmds` and `<pool>-w<N>.*`), so the names must be distinct across GPU tasks, CPU tasks, pools and pool workers, and must name a file (no `/`). The launcher refuses a spec that breaks this before anything starts, and `submit.sh` checks it before asking for an allocation (`pack_node.py --check-names SPEC`).
+
+Examples are in [`examples/specs/`](../examples/specs/); `local-demo.json` runs on any machine with two cores ([quickstart](quickstart.md)).
 
 ## What each task gets
 
@@ -67,7 +69,7 @@ Size sidecars to end with the GPU work. The launcher refuses an idle GPU at the 
 | `fake` | `--fake-gpus N` | N invented slots; tasks see no GPU (for testing the logic anywhere) |
 | `cpu` | the spec has no GPU tasks | none |
 
-`--dry-run` prints which task gets which slot and cores, and starts nothing.
+`--dry-run` prints which task gets which slot and cores, and starts nothing; it prints the plan also when the launch would be refused, and then says why (a task folder missing: exit 2).
 
 ## Signals and checkpoints
 
@@ -107,7 +109,7 @@ Two numbers matter, and they measure different things:
 - **`gpu_util`**: the share of time any kernel was running. It is what `nvidia-smi` calls utilisation.
 - **`sm_active`**: the share of the GPU's streaming multiprocessors busy while it ran, from NVML's GPM counters on Hopper. It is the quantity JSC's LLview reports as "Active SM".
 
-A small model can show high `gpu_util` and low `sm_active`: kernels run all the time, but each uses a sliver of the card. The levers are more independent work per GPU (several processes per card, or the site's MPS through `--comment "CUDA_MPS=1"` where available), bigger batches, compiled or graph-captured kernels. On GH200 the GPM numbers were calibrated with `probes/gpu_load_probe.py` at registered duty cycles: `gpu_util` read 90.8, 49.1, 29.3 and 0.0 and `sm_active` 86.6, 44.6, 24.9 and 0.0 for duty 1.0, 0.5, 0.25 and 0.0, linear and with no cross-talk onto an idle card; for a dense BF16 matmul `sm_active` was 0.96 of `gpu_util`. Run `examples/specs/gpu-metrics-calibration.json` on a new machine before you trust the numbers there.
+A small model can show high `gpu_util` and low `sm_active`: kernels run all the time, but each uses a sliver of the card. The levers are more independent work per GPU (several processes per card, or the site's MPS through `--comment "CUDA_MPS=1"` where available), bigger batches, compiled or graph-captured kernels. On GH200 the GPM numbers were calibrated with `probes/gpu_load_probe.py` at registered duty cycles: `gpu_util` read 90.8, 49.1, 29.3 and 0.0 and `sm_active` 86.6, 44.6, 24.9 and 0.0 for duty 1.0, 0.5, 0.25 and 0.0, linear and with no cross-talk onto an idle card; for a dense BF16 matmul `sm_active` was 0.96 of `gpu_util`. Run `examples/specs/gpu-metrics-calibration.json` on a new machine before you trust the numbers there. The probe reports its own GPU's readings, found by UUID (CUDA and NVML number GPUs independently), with the GPU's UUID and PCI bus id beside them.
 
 Without the `nvidia-ml-py` package, or on GPUs without GPM, the summary comes from `nvidia-smi` samples and says so (`source: nvidia-smi`, no `sm_active`).
 

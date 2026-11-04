@@ -20,7 +20,7 @@ Clone the repository into project space that compute nodes can read, for example
 bash tests/fleet_guard/run_tests.sh
 ```
 
-The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 181 passed, 0 failed`, and its exit status is 0 (any failed check makes it 1).
+The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 200 passed, 0 failed`, and its exit status is 0 (any failed check makes it 1).
 
 ## 4. Write your site file
 
@@ -41,14 +41,15 @@ One entry per lane tag, in GPU-hours. A job whose name starts with a tag that ha
 ## 6. Try the launcher without a scheduler
 
 ```bash
-python3 pack_node.py --spec examples/specs/basic-node.json --receipt-dir /tmp/r --mode fake --fake-gpus 4 --dry-run
+python3 pack_node.py --spec examples/specs/local-demo.json --receipt-dir /tmp/ganymede-demo --mode fake --fake-gpus 2 --reserve-cores 0
+cat /tmp/ganymede-demo/receipt.md
 ```
 
-Fake mode invents GPU slots and hides every real GPU from the tasks; `--dry-run` prints the plan (which task gets which slot and cores) without starting anything. Drop `--dry-run` with a spec whose commands are harmless (`sleep 5`) to see a receipt being written.
+Fake mode invents GPU slots and hides every real GPU from the tasks. The demonstration needs two cores and no GPU: two GPU tasks and a CPU sidecar each print where the launcher put them and end after two seconds, and the receipt shows the packing. For your own spec, `--dry-run` prints the plan (which task gets which slot and cores) and starts nothing; it prints the plan also when the launch would be refused, and then says why (exit 2), for example a task folder that does not exist yet. `examples/specs/basic-node.json` is the shape of a real node, four GPU tasks of eight threads and a sidecar, with folders to fill in; on a small machine, `--cores 0-35` lends its dry run a node's worth of cores.
 
 ## 7. The first real job
 
-Edit `examples/specs/smoke-node.json`: point `cwd` at your tooling folder and list your lane's packages in `--import`. Then:
+Edit `examples/specs/smoke-node.json`: point `cwd` at your tooling folder and list your lane's packages in `--import`. It holds four GPU tasks of eight threads, one for each GPU of a four-GPU node: give it as many GPU tasks as your site's `GPUS_PER_NODE` (the launcher refuses a node with a GPU left idle) and no more threads per task than `CPUS_PER_NODE` divided by that, less a core or two for the system. Then:
 
 ```bash
 bash slurm/submit.sh --site mysite --devel examples/specs/smoke-node.json

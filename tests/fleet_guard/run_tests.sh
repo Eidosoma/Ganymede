@@ -11,7 +11,7 @@
 # is 0 only when no check failed)
 HERE="$(cd "$(dirname "$0")" && pwd)"; TOOLING="${1:-$(cd "$HERE/../.." && pwd)}"
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet_guard_test.XXXXXX"); trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/stage"; cp -r "$TOOLING/slurm" "$T/stage/"; cp "$TOOLING/VERSION" "$T/stage/"; cp -r "$HERE/bin" "$T/bin"; cp "$HERE/spec.json" "$T/spec.json"
+mkdir -p "$T/stage"; cp -r "$TOOLING/slurm" "$T/stage/"; cp "$TOOLING/VERSION" "$TOOLING/pack_node.py" "$T/stage/"; cp -r "$HERE/bin" "$T/bin"; cp "$HERE/spec.json" "$T/spec.json"
 STAGE="$T/stage"; export FAKE="$T/state"; export PATH="$T/bin:$PATH"
 cp "$HERE/site.test.env" "$STAGE/slurm/site.test.env" && cp "$HERE/caps.test.json" "$STAGE/caps.json" || { echo "could not stage the test site file and caps"; exit 2; }
 export FLEET_QUEUE_FILE="$T/state/FLEET_QUEUE.log" FLEET_LOCK_DIR="$T/state/.fleet.lock" FLEET_DISPATCH_LOG="$T/dispatch.log" FLEET_LOCK_WAIT=3
@@ -25,11 +25,15 @@ reset(){ rm -rf "$FAKE"; mkdir -p "$FAKE"; rm -rf "$STAGE/receipts" "$STAGE/logs
 job()  { echo "$1|$1|${2:-1}|${3:-R}|${4:-(null)}|${5:-None}|${6:-2026-09-20T10:00:00}|${7:-other-job-$1}|1:00:00|0:10" >> "$FAKE/jobs.txt"; }
 sub()  { OUT=$(bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 "$@" "$T/spec.json" 2>"$T/state/err.txt"); RC=$?; ERR=$(cat "$T/state/err.txt"); }
 calls(){ cat "$FAKE/sbatch_calls.txt" 2>/dev/null; }
+# 1.3.23: every job is submitted held, recorded, then released when it may start: "started" is a job released at once and not queued,
+# "queued" one in the fleet queue and never released (until 1.3.22 these read as "submitted without --hold" and "with --hold")
+started(){ grep -q "^release $1$" "$FAKE/scontrol_calls.txt" 2>/dev/null && ! grep -q "|$1|" "$FLEET_QUEUE_FILE" 2>/dev/null; }
+queued(){ grep -q "|$1|" "$FLEET_QUEUE_FILE" 2>/dev/null && ! grep -q "^release $1$" "$FAKE/scontrol_calls.txt" 2>/dev/null; }
 
 echo "1. room in the fleet: a plain submission goes straight in"
 reset; job 101; job 102; sub
 check "exit 0 and a bare job id on stdout" '[ $RC = 0 ] && [[ "$OUT" =~ ^[0-9]+$ ]]'
-check "not held, not queued" '! calls | grep -q -- "--hold" && [ ! -s "$FLEET_QUEUE_FILE" ]'
+check "started at once: held only until its records were written, then released; not queued" 'started "$OUT" && [ ! -s "$FLEET_QUEUE_FILE" ]'
 check "submitted --no-requeue" 'calls | grep -q -- "--no-requeue"'
 
 echo "2. fleet full: the job is accepted and held, not refused"
@@ -60,7 +64,7 @@ echo "5. a newcomer does not jump the queue when a node frees"
 grep -v "^102|" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"
 sub --name alpha-newcomer-v1
 check "the waiting job was released first (by the pass at the start of the submission)" 'grep -q "^release $Q2$" "$FAKE/scontrol_calls.txt"'
-check "the newcomer is held behind it" 'calls | tail -1 | grep -q -- "--hold" && grep -q "|alpha-newcomer-v1|" "$FLEET_QUEUE_FILE"'
+check "the newcomer is held behind it" 'queued "$OUT" && grep -q "|alpha-newcomer-v1|" "$FLEET_QUEUE_FILE"'
 
 echo "6. a leaving job: itself not counted, its chained successor counted"
 reset; job 101; job 102; job 103; job 104; job 105 1 PD "afterany:104(unfulfilled)" Dependency; sub; Q=$OUT
@@ -191,7 +195,7 @@ reset; job 101; job 102; job 103; job 104; sub --name alpha-prune-a; QA=$OUT; su
 grep -v "^101|" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"
 bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
 check "after the head is released only the second job is left in the file" '[ $(wc -l < "$FLEET_QUEUE_FILE") = 1 ] && grep -q "|$QB|" "$FLEET_QUEUE_FILE"'
-grep -v "^$QB|" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"   # the lane cancels its waiting job
+awk -F"|" -v OFS="|" -v j="$QB" '$1==j {$4="CA"; $6="None"} {print}' "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"   # the lane cancels its waiting job: the queue shows it cancelled (1.3.23: an entry goes on evidence, not on a job missing from one reading)
 bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
 check "a cancelled waiting job is dropped from the file" '[ ! -s "$FLEET_QUEUE_FILE" ]'
 touch "$FAKE/squeue_fail"; echo "2026-09-20T17:00:00Z|999|alpha-x|1" > "$FLEET_QUEUE_FILE"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
@@ -271,11 +275,11 @@ check "budget: three pending 4 GPU-hour elements fill a 12 GPU-hour cap; another
 reset; arow "801_[0-3%4]" 801 1 PD; sub --name alpha-after-arr-v1
 check "ceiling: a pending 0-3%4 array may start four nodes at once; the next one-node job is held and queued, not started on a fifth" 'calls | grep -q -- "--hold" && grep -q "|$OUT|alpha-after-arr-v1|1$" "$FLEET_QUEUE_FILE"'
 reset; arow "802_[0-99%1]" 802 1 PD; sub --name alpha-beside-v1
-check "ceiling: a pending 100-element %1 array uses one node at a time; the next job starts without a hold" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+check "ceiling: a pending 100-element %1 array uses one node at a time; the next job starts at once" '[ $RC = 0 ] && started "$OUT"'
 reset; arow "803_[2-9%2]" 803 1 PD; arow 803_0 803 1 R; arow 803_1 803 1 R; job 101; job 102; sub --name alpha-full-v1
-check "ceiling: two running elements use up the %2 throttle; with two other jobs the fleet is full and the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+check "ceiling: two running elements use up the %2 throttle; with two other jobs the fleet is full and the next job is held and queued" 'queued "$OUT"'
 reset; arow "803_[2-9%2]" 803 1 PD; arow 803_0 803 1 R; arow 803_1 803 1 R; job 101; sub --name alpha-room-v1
-check "ceiling: the same array with one other job leaves a node free; the next job starts without a hold" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+check "ceiling: the same array with one other job leaves a node free; the next job starts at once" '[ $RC = 0 ] && started "$OUT"'
 reset; arow "804_[2-9%3]" 804 1 PD; arow 804_0 804 1 R; arow 804_1 804 1 R; job 101
 echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1
 bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 804_0 --quiet
@@ -286,14 +290,14 @@ check "held: a 0-3%2 array submitted to a full fleet is held and queued for two 
 grep -v -e "^101|" -e "^102|" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
 check "released: when two nodes free, the dispatcher releases the array" 'grep -q "^release $Q$" "$FAKE/scontrol_calls.txt"'
 sub --name alpha-after-release-v1
-check "released, still pending: the array counts its two possible elements, so the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+check "released, still pending: the array counts its two possible elements, so the next job is held and queued" 'queued "$OUT"'
 grep -v "^${Q}_\[" "$FAKE/jobs.txt" > "$FAKE/j" && mv "$FAKE/j" "$FAKE/jobs.txt"; arow "${Q}_[2-3%2]" "$Q" 1 PD; arow "${Q}_0" "$Q" 1 R; arow "${Q}_1" "$Q" 1 R
 sub --name alpha-while-running-v1
-check "running: two elements running use up the throttle; the fleet stays full and the next job is held" 'calls | tail -1 | grep -q -- "--hold"'
+check "running: two elements running use up the throttle; the fleet stays full and the next job is held and queued" 'queued "$OUT"'
 reset; echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1; sub --name alpha-bitstr-v1
 check "the dispatcher and the guard both read whole task lists (squeue with SLURM_BITSTR_LEN=0)" 'grep -q "^BITSTR=0 .*%A|%D|%t|%E|%r|%F|%j|%i" "$FAKE/squeue_calls.txt" && grep -q "^BITSTR=0 .*%D|%t|%E|%r|%V|%F|%j|%i" "$FAKE/squeue_calls.txt"'
 reset; arow "805_[0-3,5,7,...%4]" 805 1 PD; sub --name alpha-trunc-v1
-check "a task list cut short with its throttle shown counts the throttle in full (four nodes): the next job is held" 'calls | grep -q -- "--hold"'
+check "a task list cut short with its throttle shown counts the throttle in full (four nodes): the next job is held and queued" 'queued "$OUT"'
 reset; arow "806_[0-3,5,7,9,11,13,15,17" 806 1 PD; sub --name alpha-cut-v1
 check "a task list cut short with no throttle shown cannot be counted: refused (exit 4), nothing submitted" '[ $RC = 4 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "could not be computed"'
 rq(){ reset; job 101; job 102; job 103; echo "2026-11-02T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1; }
@@ -426,13 +430,13 @@ check "the review's branching case: two one-node successors of one job, both hel
 bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 104 --quiet
 check "104 leaves one node: the first successor is released, the second is not (1.3.16 started both: five)" 'grep -q "^release $S1$" "$FAKE/scontrol_calls.txt" && ! grep -q "^release $S2$" "$FAKE/scontrol_calls.txt"'
 sub --name alpha-window-v1
-check "while 104 is still ending, the released successor takes its node: a new job is held, not started on a fifth" 'calls | tail -1 | grep -q -- "--hold"'
+check "while 104 is still ending, the released successor takes its node: a new job is held and queued, not started on a fifth" 'queued "$OUT"'
 sed -i -e "s/^104|104|1|R|/104|104|1|CD|/" -e "s/^$S1|$S1|1|PD|[^|]*|[^|]*|/$S1|$S1|1|R|(null)|None|/" "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --departing 101 --quiet
 check "104 has ended and the first successor runs; 101 leaves: the second successor is released, the new job behind it waits" 'grep -q "^release $S2$" "$FAKE/scontrol_calls.txt" && [ $(grep -c "^release" "$FAKE/scontrol_calls.txt") = 2 ]'
 reset; job 101 1 CD; job 102; sub --afterany 101 --name alpha-late-v1
 check "a chained job whose predecessor has already ended is released at once, by a pass right after its submission" '[ $RC = 0 ] && calls | grep -q -- "--hold" && grep -q "^release $OUT$" "$FAKE/scontrol_calls.txt" && echo "$ERR" | grep -q "released it at once"'
 reset; job 101; job 102; job 103; sub --afterany 101 --name alpha-waits-v1; sub --name alpha-plain-v1
-check "a chained job still waiting for its predecessor does not count as waiting for a node: with three running the next plain job starts without a hold" '[ $RC = 0 ] && ! calls | tail -1 | grep -q -- "--hold"'
+check "a chained job still waiting for its predecessor does not count as waiting for a node: with three running the next plain job starts at once" '[ $RC = 0 ] && started "$OUT"'
 reset; job 101; job 102; job 103; job 104
 echo "2026-11-03T10:00:00Z|777|alpha-chained-v1|1|afterany:101" > "$FLEET_QUEUE_FILE"; job 777 1 PD "afterany:101(unfulfilled)" JobHeldUser "2026-09-20T10:00:00" alpha-chained-v1
 echo "2026-11-03T10:01:00Z|778|alpha-plain-v1|1" >> "$FLEET_QUEUE_FILE"; job 778 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-plain-v1
@@ -446,11 +450,11 @@ reset; job 101 1 F; echo "2026-11-03T10:00:00Z|777|alpha-okchain-v1|1|afterok:10
 bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
 check "an afterok predecessor that failed: never released (Slurm cancels the job, --kill-on-invalid-dep=yes)" '[ ! -s "$FAKE/scontrol_calls.txt" ]'
 reset; job 101; job 102; echo "105|105|2|PD|afterany:102(unfulfilled)|Dependency|2026-09-20T10:00:00|infra-two-v1|1:00:00|0:00" >> "$FAKE/jobs.txt"; sub --name alpha-first-v1
-check "an unheld two-node job chained behind a running one-node job counts its one extra node: with two running, one more job fits" '[ $RC = 0 ] && ! calls | grep -q -- "--hold"'
+check "an unheld two-node job chained behind a running one-node job counts its one extra node: with two running, one more job fits" '[ $RC = 0 ] && started "$OUT"'
 sub --name alpha-second-v1
-check "and a second does not: 101, 102 (then the two-node job) and the first make four (1.3.16 started it too: five once 102 ended)" 'calls | tail -1 | grep -q -- "--hold"'
+check "and a second does not: 101, 102 (then the two-node job) and the first make four (1.3.16 started it too: five once 102 ended)" 'queued "$OUT"'
 reset; job 101; job 102; job 103; for s in 105 106; do echo "$s|$s|1|PD|afterany:103(unfulfilled)|Dependency|2026-09-20T10:00:00|other-succ-$s|1:00:00|0:00" >> "$FAKE/jobs.txt"; done; sub --name alpha-third-v1
-check "two unheld one-node jobs chained behind one running job count one extra node: with three running the fleet is full, the next job held (1.3.16: started)" 'calls | grep -q -- "--hold"'
+check "two unheld one-node jobs chained behind one running job count one extra node: with three running the fleet is full, the next job held and queued (1.3.16: started)" 'queued "$OUT"'
 reset; job 101; sub --hold --afterany 101 --name alpha-ownhold-v1
 check "a chained job its lane holds itself stays out of the fleet queue (released by hand, like any held job)" '[ $RC = 0 ] && [ ! -s "$FLEET_QUEUE_FILE" ]'
 
@@ -576,7 +580,58 @@ check "the list read as rsync reads it in a pull (names that start with # or ;, 
 RC1=$(cb user@host "$CB/remote" "$CB/local"); RC2=$(cb user@host "$CB/remote" "$CB/local4" "$CB/nolist.txt")
 check "copyback.sh with three arguments, or with a list that does not exist: exit 2, nothing pulled" '[ "$RC1" = 2 ] && [ "$RC2" = 2 ] && [ ! -e "$CB/local4" ]'
 
-echo "33. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "33. a fourth review: the caller's environment, the records before the start, the dispatcher on evidence, task names, the probe's GPU, the first demonstration"
+esub(){ local envs=(); while [[ "${1:-}" == *=* ]]; do envs+=("$1"); shift; done; OUT=$(env "${envs[@]}" bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 "$@" "$T/spec.json" 2>"$T/state/err.txt"); RC=$?; ERR=$(cat "$T/state/err.txt"); }
+heldnow(){ grep -q "^$1|[^|]*|[^|]*|PD|[^|]*|JobHeldUser|" "$FAKE/jobs.txt"; }   # the scheduler still holds it
+reset; job 101; esub SBATCH_ARRAY_INX=0-99 SBATCH_WAIT=1 SLURM_NTASKS=4 SLURM_CLUSTERS=elsewhere
+check "SBATCH_ARRAY_INX=0-99, SBATCH_WAIT, SLURM_NTASKS and SLURM_CLUSTERS in the caller's environment: named and left out; sbatch got none of them, the scheduler holds one job, not an array, reserved as one task" '[ $RC = 0 ] && echo "$ERR" | grep -q "^NOTE: left out .*SBATCH_ARRAY_INX .*SLURM_NTASKS" && [ ! -s "$FAKE/sbatch_env.txt" ] && grep -q "^$OUT|$OUT|" "$FAKE/jobs.txt" && ! grep -q "_\[" "$FAKE/jobs.txt" && grep -q "|$OUT|[a-z0-9]*|4.0|01:00:00|[a-z0-9-]*|1|0|1|$" "$FLEET_RESERVATIONS_FILE"'
+reset; job 101; job 102; job 103; job 104; esub SQUEUE_USERS=someone-else
+check "SQUEUE_USERS in the caller's environment (squeue would show only that user's jobs): left out, so the guards see four nodes in flight; the job is held and queued, not started on a fifth" '[ $RC = 0 ] && grep -q "|$OUT|alpha-test-v1|1$" "$FLEET_QUEUE_FILE" && heldnow "$OUT" && ! grep -q "^release $OUT$" "$FAKE/scontrol_calls.txt"'
+reset; NOWL=$(date +%FT%T); for i in 1 2 3 4 5 6 7 8 9 10 11 12; do job $((3000+i)) 1 PD "(null)" None "$NOWL" "alpha-burst$i-v1"; done; esub SLURM_TIME_FORMAT=relative
+check "SLURM_TIME_FORMAT=relative in the caller's environment (squeue would print submit times as words the rate guard cannot read): left out; twelve submissions of the last minutes still count: refused (exit 6), nothing sent" '[ $RC = 6 ] && [ ! -s "$FAKE/sbatch_calls.txt" ]'
+reset; job 101; esub
+check "room in the fleet: submitted held; the submission record and the reservation written before the release, then released at once; not queued" '[ $RC = 0 ] && calls | grep -q -- "--hold" && grep -q "^release $OUT$" "$FAKE/scontrol_calls.txt" && grep -q "^$OUT 1$" "$FAKE/release_saw_reservation.txt" && grep -q "|$OUT|" "$FLEET_SUBMISSIONS_FILE" && ! heldnow "$OUT" && [ ! -s "$FLEET_QUEUE_FILE" ]'
+reset; job 101; esub FLEET_RESERVATIONS_FILE="$T/state/no/such/folder/R.log"
+check "the reservation file's folder does not exist: refused before anything is submitted (exit 4), the file named" '[ $RC = 4 ] && echo "$ERR" | grep -q "state file .*no/such/folder/R.log cannot be written" && [ ! -s "$FAKE/sbatch_calls.txt" ]'
+reset; job 101; esub FAKE_SBATCH_THEN='rm -f "$FLEET_RESERVATIONS_FILE"; mkdir "$FLEET_RESERVATIONS_FILE"'
+check "the reservation cannot be written once the job is in (its file became a folder): exit 7, ACCEPTED AND HELD, NOT RECORDED, the job id on stdout and the line it needed given; the job stays held, never released" '[ $RC = 7 ] && [ "$OUT" = "$(cat "$FAKE/next_id")" ] && echo "$ERR" | grep -q "ACCEPTED AND HELD, NOT RECORDED: job $OUT .*the reservation" && echo "$ERR" | grep -q "|$OUT|[a-z0-9]*|4.0|01:00:00|" && heldnow "$OUT" && ! grep -q "^release $OUT$" "$FAKE/scontrol_calls.txt"'
+reset; job 101; esub FAKE_SBATCH_THEN='touch "$FAKE/scontrol_fail"'
+check "the release fails (the controller does not answer): recorded, held and queued for the dispatcher; exit 0, said so" '[ $RC = 0 ] && echo "$ERR" | grep -q "its release failed" && grep -q "|$OUT|alpha-test-v1|1$" "$FLEET_QUEUE_FILE" && heldnow "$OUT"'
+rm -f "$FAKE/scontrol_fail"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "the next dispatcher pass releases it" '[ $(grep -c "^release $OUT$" "$FAKE/scontrol_calls.txt") = 2 ] && ! heldnow "$OUT" && [ ! -s "$FLEET_QUEUE_FILE" ]'
+reset; job 101; job 102; job 103; job 104; esub; Q=$OUT; cp "$FAKE/jobs.txt" "$T/jobs.saved"; grep -v "^$Q|" "$T/jobs.saved" > "$FAKE/jobs.txt"
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "one reading of the queue that does not show a held, queued job (the review's fault injection): its entry is kept" 'grep -q "|$Q|alpha-test-v1|1$" "$FLEET_QUEUE_FILE"'
+grep -v "^10[1-4]|" "$T/jobs.saved" > "$FAKE/jobs.txt"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "back in the readings with four nodes free: released, and gone from the fleet queue" 'grep -q "^release $Q$" "$FAKE/scontrol_calls.txt" && ! heldnow "$Q" && [ ! -s "$FLEET_QUEUE_FILE" ]'
+reset; printf '%s\n' "2026-11-04T10:00:00Z|777|alpha-gone-v1|1" "2026-11-04T10:00:00Z|778|alpha-kept-v1|1" > "$FLEET_QUEUE_FILE"; printf '777|CANCELLED by 1000\n' > "$FAKE/sacct.txt"
+bash "$STAGE/slurm/fleet_dispatch.sh" --site test > "$T/d33.out" 2>&1
+check "two queued jobs no reading shows: the one accounting shows cancelled dropped, the other kept, each said" '! grep -q "|777|" "$FLEET_QUEUE_FILE" && grep -q "|778|" "$FLEET_QUEUE_FILE" && grep -q "777 is not in the queue and ended in accounting (CANCELLED): dropped" "$T/d33.out" && grep -q "778 is not in this reading of the queue: kept" "$T/d33.out"'
+touch "$FAKE/sacct_fail"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test > "$T/d33.out" 2>&1; rm -f "$FAKE/sacct_fail"
+check "accounting cannot be read either: kept, said so" 'grep -q "|778|" "$FLEET_QUEUE_FILE" && grep -q "778 is not in this reading of the queue, and accounting could not be read: kept" "$T/d33.out"'
+python3 - "$T/dupnames.json" <<'PY'
+import json, sys
+json.dump(dict(job='alpha-dup-v1', gpu_tasks=[dict(name='train', cmd='true'), dict(name='train', cmd='true'), dict(name='a/b', cmd='true'), dict(name='p-w0', cmd='true')],
+               cpu_pools=[dict(name='p', cmd_file='c.txt')]), open(sys.argv[1], 'w'))
+PY
+reset; OUT=$(bash "$STAGE/slurm/submit.sh" --site test --time 01:00:00 "$T/dupnames.json" 2>"$T/state/err.txt"); RC=$?; ERR=$(cat "$T/state/err.txt")
+check "a spec whose task names clash (two named train, one with a slash, one a pool worker's name): refused before submission (exit 2), each named, nothing sent" '[ $RC = 2 ] && echo "$ERR" | grep -q "has the name .train. of gpu task 1" && echo "$ERR" | grep -q ".a/b. cannot name its files" && echo "$ERR" | grep -q "has the name .p-w0. of gpu task 4" && [ ! -s "$FAKE/sbatch_calls.txt" ]'
+PB=$(mktemp -d "$T/probe.XXXXXX"); cp "$TOOLING/probes/gpu_load_probe.py" "$TOOLING/probes/gpm_sampler.py" "$HERE/probe_stubs/torch.py" "$HERE/probe_stubs/pynvml.py" "$PB/"
+probe(){ local n="$1"; shift; ( cd "$PB" && env "$@" PACK_RECEIPT_DIR="$PB" PACK_TASK="$n" python3 gpu_load_probe.py --duty 0.5 --seconds 0.3 --period 0.1 > "$PB/$n.out" 2>&1 ); }
+probe c1 CUDA_VISIBLE_DEVICES=2 & P1=$!; probe c2 CUDA_VISIBLE_DEVICES=2 STUB_CUDA_ORDER=1,0,3,2 & P2=$!
+probe c3 CUDA_VISIBLE_DEVICES=2 STUB_NO_UUID=1 & P3=$!; probe c4 CUDA_VISIBLE_DEVICES=2 STUB_NO_UUID=1 CUDA_DEVICE_ORDER=PCI_BUS_ID & P4=$!; wait $P1 $P2 $P3 $P4
+pj(){ python3 -c "import json,sys; r=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); m=r['measured'] or {}; print(r['nvml_index'], m.get('graphics_util'), r['device_found_by'].split(':')[0], 'all_devices' in r)" "$PB/$1.out" 2>/dev/null; }
+check "the calibration probe on GPU 2 of four (stand-in NVML: 90, 50, 25 and 0 % busy): GPU 2's reading, 25, found by its UUID" '[ "$(pj c1)" = "2 25.0 uuid False" ]'
+check "CUDA numbering the GPUs in another order than NVML (CUDA's 2 is NVML's 3): NVML 3's reading, 0, by its UUID; never GPU 0's" '[ "$(pj c2)" = "3 0.0 uuid False" ]'
+check "no UUID from torch, no PCI bus order: no reading claimed for the task, every GPU's printed" '[ "$(pj c3)" = "None None not identified True" ]'
+check "no UUID, CUDA_DEVICE_ORDER=PCI_BUS_ID (NVML's order): the index counts, 25" '[ "$(pj c4)" = "2 25.0 index, CUDA_DEVICE_ORDER=PCI_BUS_ID False" ]'
+C2=$(python3 -c "import os; print(','.join(map(str, sorted(os.sched_getaffinity(0))[-2:])))"); DEMO=$(mktemp -d "$T/demo.XXXXXX")
+( cd "$DEMO" && taskset -c "$C2" python3 "$TOOLING/pack_node.py" --spec "$TOOLING/examples/specs/local-demo.json" --receipt-dir "$DEMO/r" --mode fake --fake-gpus 2 --reserve-cores 0 > "$DEMO/out.txt" 2>&1 ); RC=$?
+check "the first demonstration (examples/specs/local-demo.json) on two cores, from an empty folder: exit 0, all_ok, three tasks, each printing where it ran" '[ $RC = 0 ] && python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r[\"all_ok\"] and len(r[\"tasks\"]) == 3 else 1)" "$DEMO/r/receipt.json" && grep -q "^training train-a in slot" "$DEMO/r/train-a.out" && grep -q "^evaluating evaluate in slot" "$DEMO/r/evaluate.out"'
+( cd "$DEMO" && taskset -c "$C2" python3 "$TOOLING/pack_node.py" --spec "$TOOLING/examples/specs/local-demo.json" --receipt-dir "$DEMO/r2" --mode fake --fake-gpus 2 --reserve-cores 0 --dry-run > "$DEMO/dry.txt" 2>&1 ); RC=$?
+check "and its dry run: the plan for three tasks, exit 0" '[ $RC = 0 ] && [ $(grep -c "^\[" "$DEMO/dry.txt") = 3 ]'
+
+echo "34. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"

@@ -155,4 +155,26 @@ echo "K15. a CPU pool whose command file cannot be read: refused before anything
 pspec p5 no-such-file.cmds
 (cd "$T" && exec python3 "$PN" --spec "$T/p5.json" --receipt-dir "$T/p5" --mode cpu --reserve-cores 0 --grace 5 >"$T/p5.out" 2>"$T/p5.err"); RC=$?
 check "exit 2, the pool and the reason named, no receipt" '[ "$RC" = 2 ] && grep -q "REFUSED: cpu_pool p: its command file cannot be read" "$T/p5.err" && [ ! -e "$T/p5/receipt.json" ]'
+echo "K16. task names name the receipt's files: two tasks named alike, a name with a slash, a pool worker's name taken: refused before anything starts"
+python3 - "$T/k16.json" "$T/k16.ready" <<'PY'
+import json, sys
+mk = lambda n: dict(name=n, cwd=sys.argv[2].rsplit('/', 1)[0], cmd=f"python3 -c \"open('{sys.argv[2]}', 'w').write('{n}')\"")
+json.dump(dict(job='alpha-k16', gpu_tasks=[mk('train'), mk('train')]), open(sys.argv[1], 'w'))
+json.dump(dict(job='alpha-k16b', gpu_tasks=[mk('a/b'), mk('w-w0')], cpu_pools=[dict(name='w', cmd_file='k16.cmds', cwd=sys.argv[2].rsplit('/', 1)[0])]),
+          open(sys.argv[1].replace('.json', 'b.json'), 'w'))
+PY
+printf 'true\n' > "$T/k16.cmds"
+(cd "$T" && exec python3 "$PN" --spec "$T/k16.json" --receipt-dir "$T/k16" --mode fake --fake-gpus 2 --reserve-cores 0 --grace 5 >"$T/k16.out" 2>"$T/k16.err"); RC=$?
+check "two GPU tasks named train: exit 2, REFUSED and named, nothing started, no receipt" '[ "$RC" = 2 ] && grep -q "REFUSED: task names: gpu task 2 has the name .train. of gpu task 1" "$T/k16.err" && [ ! -e "$T/k16.ready" ] && [ ! -e "$T/k16/receipt.json" ]'
+(cd "$T" && exec python3 "$PN" --spec "$T/k16b.json" --receipt-dir "$T/k16b" --mode fake --fake-gpus 2 --reserve-cores 0 --grace 5 >"$T/k16b.out" 2>"$T/k16b.err"); RC=$?
+check "a name with a slash, and a GPU task named like the pool's first worker: exit 2, both named, nothing started" '[ "$RC" = 2 ] && grep -q ".a/b. cannot name its files" "$T/k16b.err" && grep -q "worker 0 has the name .w-w0. of gpu task 2" "$T/k16b.err" && [ ! -e "$T/k16.ready" ]'
+python3 "$PN" --check-names "$T/k16.json" "$T/k16b.json" 2>"$T/k16c.err"; RC=$?
+check "--check-names (the submit wrapper's check): exit 2, each spec's problems named; a clean spec passes" '[ "$RC" = 2 ] && [ $(grep -c "^REFUSED: " "$T/k16c.err") = 3 ] && python3 "$PN" --check-names "$T/c14b.json"'
+echo "K17. the dry run shows its plan even when the launch would be refused"
+python3 - "$T/k17.json" <<'PY'
+import json, sys
+json.dump(dict(job='alpha-k17', gpu_tasks=[dict(name='seed-0', cwd='/no/such/folder', cmd='true'), dict(name='seed-1', cwd='/no/such/folder', cmd='true')]), open(sys.argv[1], 'w'))
+PY
+(cd "$T" && exec python3 "$PN" --spec "$T/k17.json" --receipt-dir "$T/k17" --mode fake --fake-gpus 2 --reserve-cores 0 --dry-run >"$T/k17.out" 2>"$T/k17.err"); RC=$?
+check "folders that do not exist: the plan for both tasks first, then 'the launch would be REFUSED' naming them; exit 2" '[ "$RC" = 2 ] && [ $(grep -c "^\[gpu\] seed-" "$T/k17.out") = 2 ] && grep -q "the launch would be REFUSED: task folder(s) missing: seed-0 (/no/such/folder); seed-1" "$T/k17.err"'
 echo "LAUNCHER RESULT: $PASS passed, $FAILS failed"; [ "$FAILS" = 0 ]
