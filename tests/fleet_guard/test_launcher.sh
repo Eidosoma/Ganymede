@@ -138,4 +138,8 @@ check "exit 0; one completed, one interrupted (killed by the signal, exit -10), 
 echo "K12. a pool command that failed before the signal: not a checkpoint segment"
 printf '%s\n' "false" "READY=$T/p3.ready exec python3 $T/fg.py" > "$T/p3.cmds"; pspec p3 p3.cmds; poolrun p3
 check "exit 1, not a checkpoint segment, one failed; the rest still kept in the resume file" '[ "$RC" = 1 ] && [ "$(rj "$T/p3/receipt.json" "r[\"checkpoint_segment\"] is False and r[\"all_ok\"] is False and r[\"pools\"][0][\"failed\"]==1 and r[\"pools\"][0][\"resume_file\"]==\"p.resume.cmds\"")" = True ]'
+echo "K13. a pool command gets PACK_RECEIPT_DIR, as tasks do (the third review: KeyError)"
+printf '%s\n' "python3 -c \"import os; open(os.environ['PACK_RECEIPT_DIR'] + '/pool-saw-it', 'w').write('ok')\"" > "$T/p4.cmds"; pspec p4 p4.cmds
+(cd "$T" && exec python3 "$PN" --spec "$T/p4.json" --receipt-dir "$T/p4" --mode cpu --reserve-cores 0 --grace 5 >"$T/p4.out" 2>"$T/p4.err"); RC=$?
+check "exit 0; the command ran with it: its file is in the receipt folder; one completed, none failed" '[ "$RC" = 0 ] && [ -e "$T/p4/pool-saw-it" ] && [ "$(rj "$T/p4/receipt.json" "r[\"pools\"][0][\"failed\"]==0 and r[\"pools\"][0][\"completed\"]==1")" = True ]'
 echo "LAUNCHER RESULT: $PASS passed, $FAILS failed"; [ "$FAILS" = 0 ]

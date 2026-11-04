@@ -7,8 +7,10 @@ LIMIT_MB=${FLEET_MAX_FILE_MB:-10}; LIMIT=$((LIMIT_MB*1024*1024))
 bad=0
 while IFS= read -r -d '' path; do
   size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
-  if [ "$size" -gt "$LIMIT" ]; then printf 'refused: %s is %d MB (limit %d MB)\n' "$path" $((size/1024/1024)) "$LIMIT_MB" >&2; bad=1; fi
-done < <(git diff --cached --name-only --diff-filter=AM -z)
+  if [ "$size" -gt "$LIMIT" ]; then printf 'refused: %s is %d bytes, over the %d MB limit\n' "$path" "$size" "$LIMIT_MB" >&2; bad=1; fi
+# --no-renames: a file renamed and changed counts as added under its new name. With rename detection a renamed file that grew past
+# the limit showed as R (66 % similar) and was never measured; T: a symlink that became a file
+done < <(git diff --cached --no-renames --name-only --diff-filter=AMT -z)
 if [ $bad != 0 ]; then
   echo "Fleet pre-commit hook: large files refused. Keep outputs outside git (\$FLEET_RUNS or \$FLEET_KEEP); commit receipts, packets, protocols, scripts and tests only. A deliberate exception: FLEET_ALLOW_LARGE=1 git commit ..." >&2
   exit 1

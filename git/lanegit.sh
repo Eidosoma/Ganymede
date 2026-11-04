@@ -94,14 +94,20 @@ cmd_commit() {
   [ $# -ge 1 ] || die 'no paths given'; [ -n "$msg" ] || die 'empty message'
   local lanerel; lanerel=$(rel "$lane") || exit 1; [ -d "$ROOT/$lanerel" ] || die "no such lane folder: $lane"
   replay_pending "$lanerel"
-  local files=() p r f sz
+  local files=() p r f sz n0
   for p in "$@"; do
     r=$(rel "$p") || exit 1
     case "$r/" in "$lanerel"/*) ;; *) die "path outside your lane folder ($lanerel): $p";; esac
     if [ -d "$ROOT/$r" ]; then
       while IFS= read -r -d '' f; do files+=("$f"); done < <($G ls-files -z -m -o -d --exclude-standard -- "$r"; $G diff-index -z --cached --name-only HEAD -- "$r")   # and what is staged against HEAD
-    elif [ -e "$ROOT/$r" ] || $G ls-files --error-unmatch -- "$r" >/dev/null 2>&1; then files+=("$r")
-    else die "no such path: $p"; fi
+    elif [ -e "$ROOT/$r" ] || [ -L "$ROOT/$r" ]; then files+=("$r")
+    else
+      # gone from the disk: a deleted file, or a deleted folder, as every path HEAD or the index holds at or under it, each to be
+      # removed (a deleted folder named by its own path must never give NOTHING TO COMMIT and leave its files in HEAD)
+      n0=${#files[@]}
+      while IFS= read -r -d '' f; do files+=("$f"); done < <($G ls-tree -r -z --name-only HEAD -- "$r"; $G ls-files -z -- "$r")
+      [ ${#files[@]} -gt "$n0" ] || die "no such path: $p"
+    fi
   done
   [ ${#files[@]} -ge 1 ] || die 'nothing changed under the given paths'
   mapfile -d '' files < <(printf '%s\0' "${files[@]}" | sort -zu)   # a path both changed and staged, once

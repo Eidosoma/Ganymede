@@ -27,7 +27,7 @@ the receipt), so pool commands must be safe to run again.
 Sidecars (cpu_tasks and pools) run at --sidecar-nice (default 10) so GPU feeders win any contention; a task's "mem_gb" sets an
 address-space limit (ulimit -v) so a sidecar cannot push a GPU feeder into swap. --gpu-cores reserves cores per GPU task
 (JUPITER: 8 of 72 per socket, NUMA-local with --numa); everything else is sidecar territory.
-Each task gets: CUDA_VISIBLE_DEVICES (its GPU, or "" in fake mode), PACK_SLOT, PACK_TASK, PACK_JOB, PACK_CORES, PACK_RECEIPT_DIR (the job's receipt folder, for small per-task records),
+Each task, and each pool command, gets: CUDA_VISIBLE_DEVICES (its GPU, or "" in fake mode), PACK_SLOT, PACK_TASK, PACK_JOB, PACK_CORES, PACK_RECEIPT_DIR (the job's receipt folder, for small per-task records),
 OMP_NUM_THREADS / MKL_NUM_THREADS / OPENBLAS_NUM_THREADS / NUMEXPR_NUM_THREADS / TORCH_NUM_THREADS = threads, and is pinned with taskset to its cores.
 Receipt: <receipt-dir>/receipt.json and receipt.md (per-task wall, exit code, user/system CPU seconds, max RSS, checkpoint_segment when SIGUSR1 was forwarded and every task then exited 0 and no pool command had failed,
 GPU-slot-hours held = slots * wall / 3600, optional nvidia-smi samples). Exit code: 0 if every task exited 0, else 1;
@@ -304,7 +304,7 @@ def main():
         for w in range(pl['parallel']):
             c=pl['_cores'][w*pl['threads']:(w+1)*pl['threads']] or pl['_cores'][:1]
             env=dict(os.environ); env.update({k2:str(v) for k2,v in pl.get('env',{}).items()})
-            th=str(pl['threads']); env.update(CUDA_VISIBLE_DEVICES='',PACK_SLOT='',PACK_TASK=f"{pl['name']}-w{w}",PACK_JOB=receipt['job'],PACK_CORES=','.join(map(str,c)),PACK_MODE=mode,
+            th=str(pl['threads']); env.update(CUDA_VISIBLE_DEVICES='',PACK_SLOT='',PACK_TASK=f"{pl['name']}-w{w}",PACK_JOB=receipt['job'],PACK_CORES=','.join(map(str,c)),PACK_MODE=mode,PACK_RECEIPT_DIR=os.path.abspath(args.receipt_dir),
                                         OMP_NUM_THREADS=th,MKL_NUM_THREADS=th,OPENBLAS_NUM_THREADS=th,NUMEXPR_NUM_THREADS=th,TORCH_NUM_THREADS=th,PYTHONDONTWRITEBYTECODE='1')
             rd=os.path.abspath(args.receipt_dir)
             cmdf=os.path.join(rd,f"{pl['name']}.cmds")

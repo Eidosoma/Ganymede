@@ -20,7 +20,7 @@ Clone the repository into project space that compute nodes can read, for example
 bash tests/fleet_guard/run_tests.sh
 ```
 
-The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 148 passed, 0 failed`, and its exit status is 0 (any failed check makes it 1).
+The suite puts a fake `squeue`, `sbatch`, `scontrol` and `sacct` first on `PATH`, works on a temporary copy, and never reaches your scheduler. The last line should read `RESULT: 149 passed, 0 failed`, and its exit status is 0 (any failed check makes it 1).
 
 ## 4. Write your site file
 

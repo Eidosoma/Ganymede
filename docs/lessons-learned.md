@@ -98,6 +98,10 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **Loose objects slowed every commit.** Many small commits left 24,000 loose objects. *Rule:* repack incrementally when they pass 20,000 (`git repack -d -l`: 3 minutes 24 seconds, no lock); a full `git gc` took two hours.
 
+**A folder that is gone still has files.** Found in the third review, and reproduced: a deleted folder named by its own path matched nothing on the disk, so the commit tool reported nothing to commit while the folder's files stayed in HEAD. *Rule:* a path that is gone is expanded against what the last commit holds.
+
+**A rename can carry a write.** Found in the same review, and reproduced: the size hook skipped the files git saw as renamed, so a file renamed and grown past the limit went in. *Rule:* a size check reads every file a commit writes, with rename detection off.
+
 ## People and agents
 
 **A word is not a habit.** An approval given for one job was never meant for the next one, and a raised cap was never meant as an approval. *Rule:* one word per job, recorded verbatim with the time it was first seen, spent by the submit ([operating-model.md](operating-model.md)).

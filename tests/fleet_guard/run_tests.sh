@@ -330,6 +330,10 @@ reset; sub --name -oops
 check "a job name with an empty lane tag (-oops): refused (exit 2), sbatch never called" '[ $RC = 2 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "has no lane tag"'
 python3 "$STAGE/slurm/budget.py" --site test --lane '' --est-hours 4 >/dev/null 2>"$T/state/b.err"; BRC=$?
 check "the budget check asked about an empty lane tag: refused (exit 3), not read as a plain table" '[ $BRC = 3 ] && grep -q "an empty lane tag" "$T/state/b.err"'
+printf '%s\n' "9001|alpha-x-v1|acct|gpu|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED|2026-11-01T10:00:00|2026-11-01T11:00:00|288" > "$T/ledger.sacct"
+echo '{"alpha": 1.5, "beta": "x", "gamma": 2}' > "$T/caps.ledger.json"
+LOUT=$(python3 "$STAGE/slurm/ledger_from_sacct.py" --sacct-file "$T/ledger.sacct" --caps "$T/caps.ledger.json" --ledger "$T/ledger.md" 2>&1); LRC=$?
+check "the ledger's summary with a fractional cap (1.5): no crash, the cap, what is left and OVER CAP printed, an entry that is not a cap named, the row written (1.3.18: ValueError after writing the ledger)" '[ $LRC = 0 ] && echo "$LOUT" | grep -q "alpha .* cap  *1.50  left  *-2.50  OVER CAP" && echo "$LOUT" | grep -q "beta .*not a usable cap" && echo "$LOUT" | grep -q "total .* cap  *3.50" && grep -q "^| 9001 | alpha |" "$T/ledger.md"'
 cp "$T/caps.saved" "$STAGE/caps.json"
 
 echo "25. the launcher's task shell under the checkpoint signal, and a task that cannot start: tests/fleet_guard/test_launcher.sh"

@@ -48,7 +48,7 @@ One more thing to know: `sacct -a` shows only the jobs your site lets you see. O
 python3 slurm/ledger_from_sacct.py --since 2026-09-18 --account my-project --caps caps.json --ledger ALLOCATION_LEDGER.md --gpus-per-node 4 --charge-node-gpus
 ```
 
-Appends one row per new job to a Markdown table (job, lane, name, partition, nodes, GPUs, cores, elapsed seconds, GPU-hours, core-hours, state, start and end in UTC) and prints totals per lane against the caps. It is idempotent per job id, and a row first written while a job was still running is replaced with the final accounting once it ends. `--account` reads one account only, and the read goes in UTC windows of `--window-days` (7), each job once. `--sacct-file` reads a saved dump instead of calling `sacct`.
+Appends one row per new job to a Markdown table (job, lane, name, partition, nodes, GPUs, cores, elapsed seconds, GPU-hours, core-hours, state, start and end in UTC) and prints totals per lane against the caps. It is idempotent per job id, and a row first written while a job was still running is replaced with the final accounting once it ends. `--account` reads one account only, and the read goes in UTC windows of `--window-days` (7), each job once. `--sacct-file` reads a saved dump instead of calling `sacct`. The summary reads `caps.json` with the budget check's own validation: a cap is any finite, non-negative number, 1.5 as well as 1200, and an unusable file or entry is named in the summary without stopping the ledger.
 
 ## The site's own view
 

@@ -42,7 +42,7 @@ Examples are in [`examples/specs/`](../examples/specs/).
 | `CUDA_VISIBLE_DEVICES` | its own GPU (empty for CPU tasks and in fake mode) |
 | `PACK_SLOT`, `PACK_TASK`, `PACK_JOB`, `PACK_MODE` | its slot, task name, job name and the launcher's mode |
 | `PACK_CORES` | the cores it is pinned to (it runs under `taskset`) |
-| `PACK_RECEIPT_DIR` | the job's receipt folder, for small per-task records |
+| `PACK_RECEIPT_DIR` | the job's receipt folder, for small per-task records (pool commands get it too) |
 | `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `TORCH_NUM_THREADS` | the task's `threads` |
 | `PYTHONDONTWRITEBYTECODE` | `1` unless already set |
 

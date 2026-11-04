@@ -47,7 +47,11 @@ def main():
     ap.add_argument('--ledger',default='ALLOCATION_LEDGER.md'); ap.add_argument('--gpus-per-node',type=int,default=4)
     ap.add_argument('--charge-node-gpus',action='store_true',help='whole-node sites (JUPITER): a job with no gres/gpu is still charged nodes x gpus-per-node')
     ap.add_argument('--account',default='',help='read this account only (sacct -A)'); ap.add_argument('--window-days',type=float,default=7.0,help='read accounting in UTC windows of this many days (default 7)'); a=ap.parse_args()
-    jobs=rows(a); caps=json.load(open(a.caps)) if os.path.exists(a.caps) else {}
+    # caps through the budget check's own validation; a report, so an unusable file or entry is named, never fatal (reading any JSON as
+    # caps, with a cap formatted as an integer, once crashed the summary on 1.5 after the ledger was written)
+    sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from budget import load_caps
+    caps,badcaps,capnote=load_caps(a.caps)
+    jobs=rows(a)
     # Rows are idempotent per JobID, except that a row written while the job was still queued or running (a non-terminal
     # state) is replaced when the job is next seen, so the charged hours are final ones. Terminal rows are never rewritten.
     NONTERMINAL=('RUNNING','PENDING','CONFIGURING','COMPLETING','SUSPENDED','REQUEUED','RESIZING')
@@ -72,8 +76,11 @@ def main():
             if len(c)<10: continue
             tot[c[1]]=tot.get(c[1],0)+float(c[8]); ch[c[1]]=ch.get(c[1],0)+float(c[9])
     print(f'{len(new)} new job rows appended; totals (GPU-hours):')
-    for lane in sorted(set(tot)|set(caps)):
+    if capnote: print(f'  (caps: {capnote}; the totals are shown without caps)')
+    for lane in sorted(set(tot)|set(caps)|set(badcaps)):
         cap=caps.get(lane); used=round(tot.get(lane,0),2)
-        print(f"  {lane:8s} used {used:9.2f}" + (f"  cap {cap:6d}  left {cap-used:9.2f}" + ("  OVER CAP" if used>cap else "") if cap is not None else "  (no cap)") + f"  core-hours {round(ch.get(lane,0),2):9.2f}")
-    print(f"  {'total':8s} used {round(sum(tot.values()),2):9.2f}  cap {sum(v for v in caps.values() if isinstance(v,(int,float))):6d}")
+        capcol=((f"  cap {cap:9.2f}  left {cap-used:9.2f}" + ("  OVER CAP" if used>cap else "")) if cap is not None else
+                (f"  (not a usable cap: {badcaps[lane]!r})" if lane in badcaps else "  (no cap)"))
+        print(f"  {lane:8s} used {used:9.2f}" + capcol + f"  core-hours {round(ch.get(lane,0),2):9.2f}")
+    print(f"  {'total':8s} used {round(sum(tot.values()),2):9.2f}  cap {sum(caps.values()):9.2f}")
 if __name__=='__main__': main()

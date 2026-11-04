@@ -35,6 +35,7 @@ You share this node with other users and other lanes, and all your sessions shar
 ## Submitting
 
 - Submit only on the principal's word for that named job. The word covers that one job. A raised cap is not a word.
+- `submit.sh` does not check the word yet (single-use approval verification is planned): keeping this rule is up to you, and the reviewer checks every job against your record.
 - Record the word before submitting, in `authorised_by.json` (see the example): the words verbatim, the time you first observed them (`date -u` at your first command after the message), the line, and the checks: the controller answers, accounting shows no job of that name since the period began (`TZ=UTC sacct -X -A <account> -S <date> --format=JobID,JobName%40,State -P -n`), the cap has room.
 - Submit once: `bash <fleet>/slurm/submit.sh --site <site> --time <limit> <spec>`. If it says QUEUED BY THE FLEET GUARD, wait; it will start in turn.
 - If the wrapper refuses or `sbatch` fails, report the message and stop. Do not retry unless the principal explicitly allows one retry.
