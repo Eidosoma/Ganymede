@@ -199,7 +199,7 @@ def main():
     if a.json: print(json.dumps(rows,indent=1))
     else:
         print(f"{'lane':8s} {'used':>9s} {'committed':>10s} {'cap':>7s} {'headroom':>9s}  R/PD")
-        for r in rows: print(f"{r['lane']:8s} {r['used']:9.2f} {r['committed']:10.2f} {str(r['cap'] or '-'):>7s} {str(r['headroom'] if r['headroom'] is not None else '-'):>9s}  {r['queue']['R']}/{r['queue']['PD']}")
+        for r in rows: print(f"{r['lane']:8s} {r['used']:9.2f} {r['committed']:10.2f} {('-' if r['cap'] is None else str(r['cap'])):>7s} {str(r['headroom'] if r['headroom'] is not None else '-'):>9s}  {r['queue']['R']}/{r['queue']['PD']}")
     if a.lane is None:
         for lane,j in sorted(unbounded.items()): print(f"BUDGET: lane {lane}: job(s) {' '.join(j[:5])} in the queue with no time limit (UNLIMITED, or one that cannot be read): no worst case, so the lane admits nothing more until they get one",file=sys.stderr)
     if a.lane is not None:

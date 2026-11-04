@@ -102,6 +102,8 @@ Ganymede's first version drew on a year of running agent fleets, with safeguards
 
 **A rename can carry a write.** Found in the same review, and reproduced: the size hook skipped the files git saw as renamed, so a file renamed and grown past the limit went in. *Rule:* a size check reads every file a commit writes, with rename detection off.
 
+**A copy keeps the sender's clock.** Found while writing the copy-back helper's first tests, and reproduced: its manifest took the files newer than the list, but rsync -a gives every file the remote's modification time, so the files it had just pulled were older than the list and were left out, and the manifest held one line, its own. *Rule:* a manifest names the files it is about, never the files that look new.
+
 ## People and agents
 
 **A word is not a habit.** An approval given for one job was never meant for the next one, and a raised cap was never meant as an approval. *Rule:* one word per job, recorded verbatim with the time it was first seen, spent by the submit ([operating-model.md](operating-model.md)).

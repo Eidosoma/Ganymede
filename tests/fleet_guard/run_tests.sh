@@ -1,8 +1,9 @@
 #!/bin/bash
-# tests/fleet_guard/run_tests.sh [TOOLING_DIR]: the submit wrapper's guards, the fleet queue and its dispatcher, the budget check and
-# wait_jobs.py, run against a FAKE Slurm (bin/: squeue, sbatch, scontrol, sacct over a state file), then the launcher's GPU-idle
-# watchdog (test_watchdog.sh), the scoped fast-forward (test_ffscoped.sh), the launcher's task shell and launch failures
-# (test_launcher.sh), lanegit's index update (test_lanegit.sh) and the login check (test_login_check.sh). Nothing here can reach a
+# tests/fleet_guard/run_tests.sh [TOOLING_DIR]: the submit wrapper's guards, the fleet queue and its dispatcher, the budget check,
+# wait_jobs.py, the status screens and the copy-back helper, run against a FAKE Slurm (bin/: squeue, sbatch, scontrol, sacct over a
+# state file), then the launcher's GPU-idle watchdog (test_watchdog.sh), the scoped fast-forward (test_ffscoped.sh), the launcher's
+# task shell and launch failures (test_launcher.sh), lanegit and the git hooks (test_lanegit.sh) and the login check
+# (test_login_check.sh). Nothing here can reach a
 # real scheduler: PATH puts the
 # fakes first, and the tooling under test is a temporary copy with the test site file (site.test.env: four nodes, review threshold 50)
 # and the test caps (caps.test.json), so no live receipt, log, queue or caps file is touched.
@@ -453,7 +454,129 @@ check "two unheld one-node jobs chained behind one running job count one extra n
 reset; job 101; sub --hold --afterany 101 --name alpha-ownhold-v1
 check "a chained job its lane holds itself stays out of the fleet queue (released by hand, like any held job)" '[ $RC = 0 ] && [ ! -s "$FLEET_QUEUE_FILE" ]'
 
-echo "30. the login-node load check: tests/fleet_guard/test_login_check.sh"
+echo "30. the batch script (slurm/node.sbatch) run outside Slurm: the checkpoint signal forwarded, the job log, the dispatcher at its end"
+cp "$TOOLING/pack_node.py" "$STAGE/pack_node.py"
+cat > "$T/nb_task.py" <<'PYEOF'
+# a checkpoint-aware task: on SIGUSR1 it saves for a second, writes its mark and exits 0
+import os, signal, sys, time
+def save(*_):
+    time.sleep(1); open(os.environ['NB_MARK'], 'w').write('saved'); sys.exit(0)
+signal.signal(signal.SIGUSR1, save)
+open(os.environ['NB_READY'], 'w').write('ready')
+time.sleep(60)
+PYEOF
+nbspec(){ python3 -c 'import json,sys; json.dump(dict(job="alpha-nb-v1", gpu_tasks=[dict(name="t0", cmd=sys.argv[2], cwd=sys.argv[3])], cpu_tasks=[]), open(sys.argv[1], "w"))' "$T/$1.json" "$2" "$T"; }
+nbrun(){  # $1 name, $2 job id, $3 usr1: send SIGUSR1 to the batch shell once the task is ready. NB_PACK overrides the launcher's arguments.
+  rm -f "$T/$1.ready" "$T/$1.mark"
+  ( cd "$STAGE" && FLEET_DIR="$STAGE" SPEC="$T/$1.json" SLURM_JOB_ID="$2" SLURM_JOB_NAME=alpha-nb-v1 ENV_ACTIVATE=: PACK_EXTRA= \
+      PACK_ARGS="${NB_PACK:---mode fake --fake-gpus 1 --reserve-cores 0 --grace 5}" FLEET_SITE=test NB_READY="$T/$1.ready" NB_MARK="$T/$1.mark" \
+      exec bash "$STAGE/slurm/node.sbatch" > "$T/$1.out" 2> "$T/$1.err" ) &
+  local bp=$! i=0
+  if [ "${3:-}" = usr1 ]; then while [ ! -e "$T/$1.ready" ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i+1)); done; kill -USR1 "$bp"; fi
+  wait "$bp"; NBRC=$?
+}
+reset; job 4242; job 102; job 103; job 104; echo "2026-11-04T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1
+nbspec nb1 "python3 $T/nb_task.py"; nbrun nb1 4242 usr1
+check "SIGUSR1 to the batch shell (Slurm's warning): forwarded to the launcher, the task saved, exit 0" '[ "$NBRC" = 0 ] && [ -e "$T/nb1.mark" ] && grep -q "batch shell: USR1 from Slurm, forwarded to the launcher" "$T/nb1.out"'
+check "the receipt says a clean checkpoint segment; the job log has the START and a DONE with rc=0" '[ "$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r[\"checkpoint_segment\"] is True and r[\"all_ok\"] is True)" "$STAGE/receipts/alpha-nb-v1-4242/receipt.json")" = True ] && grep -q " START job=4242 name=alpha-nb-v1 " "$STAGE/receipts/JOBS.log" && grep -q " DONE job=4242 name=alpha-nb-v1 rc=0 " "$STAGE/receipts/JOBS.log"'
+check "at its end the dispatcher ran with this job departing: the waiting job released into its node" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt" && grep -q "RELEASED job=777 .*departing=4242" "$FLEET_DISPATCH_LOG"'
+reset; nbspec nb2 "python3 -c 'import sys; sys.exit(3)'"; nbrun nb2 4243
+check "a task that fails: the batch script exits 1, the job log says FAILED with rc=1" '[ "$NBRC" = 1 ] && grep -q " FAILED job=4243 name=alpha-nb-v1 rc=1 " "$STAGE/receipts/JOBS.log"'
+reset; nbspec nb3 "true"; NB_PACK="--mode fake --fake-gpus 2 --reserve-cores 0 --grace 5" nbrun nb3 4244
+check "a spec the launcher refuses (one GPU task for two slots): exit 2, the job log says REFUSED with rc=2" '[ "$NBRC" = 2 ] && grep -q " REFUSED job=4244 name=alpha-nb-v1 rc=2 " "$STAGE/receipts/JOBS.log"'
+
+echo "31. smaller guards: --comment, the nodes-in-flight helper on input it cannot read, the dispatcher's own lock and a failed release, the ledger's row refresh"
+reset; sub --comment "CUDA_MPS=1"
+check "--comment KEY=VALUE: passed to sbatch and noted" '[ $RC = 0 ] && calls | grep -q -- "--comment=CUDA_MPS=1" && echo "$ERR" | grep -q "via --comment: CUDA_MPS=1"'
+N=0; for v in "CUDA_MPS=1,THP=never" 'X="1"' "X='1'"; do reset; sub --comment "$v"; [ $RC = 2 ] && [ ! -s "$FAKE/sbatch_calls.txt" ] && echo "$ERR" | grep -q "may not contain commas or quotes" && N=$((N+1)); done
+check "--comment with a comma, a double quote or a single quote: each refused (exit 2), nothing sent" '[ $N = 3 ]'
+IF="$STAGE/slurm/inflight.py"
+printf 'R|1\n' | python3 "$IF" --fields D,t,E,r,V,F,j,i >/dev/null 2>"$T/state/if.err"; IRC=$?
+check "the nodes-in-flight helper on a queue line without its fields: exit 3, saying so" '[ $IRC = 3 ] && grep -q "does not carry the fields" "$T/state/if.err"'
+printf 'x|R|(null)|None|2026-01-01T00:00:00|101|a-b|101\n' | python3 "$IF" --fields D,t,E,r,V,F,j,i >/dev/null 2>"$T/state/if.err"; IRC=$?
+check "a node count that is not a number: exit 3, saying so" '[ $IRC = 3 ] && grep -q "a node count is not a number" "$T/state/if.err"'
+printf '1|PD|(null)|None|2026-01-01T00:00:00|806|a-b|806_[0-3,x]\n' | python3 "$IF" --fields D,t,E,r,V,F,j,i >/dev/null 2>"$T/state/if.err"; IRC=$?
+check "a pending array whose task list cannot be read and shows no throttle: exit 3, saying so" '[ $IRC = 3 ] && grep -q "its task list cannot be read and no throttle is shown" "$T/state/if.err"'
+reset; job 101; job 102; job 103; echo "2026-11-04T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1
+mkdir -p "$FLEET_LOCK_DIR"; touch -d "10 minutes ago" "$FLEET_LOCK_DIR"; bash "$STAGE/slurm/fleet_dispatch.sh" --site test --quiet
+check "the dispatcher meets a stale fleet lock (its holder died): takes it over, releases the waiting job, leaves no lock" 'grep -q "^release 777$" "$FAKE/scontrol_calls.txt" && [ ! -d "$FLEET_LOCK_DIR" ]'
+reset; job 101; echo "2026-11-04T10:00:00Z|777|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"; job 777 1 PD "(null)" JobHeldUser "2026-09-20T10:00:00" alpha-waiting-v1; touch "$FAKE/scontrol_fail"
+OUTD=$(bash "$STAGE/slurm/fleet_dispatch.sh" --site test 2>&1)
+check "scontrol release fails: the job stays held and in the fleet queue, and the pass says so" 'echo "$OUTD" | grep -q "release of 777 failed; left held" && grep -q "|777|" "$FLEET_QUEUE_FILE"'
+rm -f "$FAKE/scontrol_fail"
+printf '%s\n' "9002|alpha-r-v1|acct|gpu|1|billing=288,cpu=288,gres/gpu=4,node=1|1800|RUNNING|2026-11-01T10:00:00|Unknown|288" > "$T/l2.sacct"
+python3 "$STAGE/slurm/ledger_from_sacct.py" --sacct-file "$T/l2.sacct" --caps "$T/caps.ledger.json" --ledger "$T/l2.md" >/dev/null 2>&1
+printf '%s\n' "9002|alpha-r-v1|acct|gpu|1|billing=288,cpu=288,gres/gpu=4,node=1|3600|COMPLETED|2026-11-01T10:00:00|2026-11-01T11:00:00|288" > "$T/l2.sacct"
+LOUT=$(python3 "$STAGE/slurm/ledger_from_sacct.py" --sacct-file "$T/l2.sacct" --caps "$T/caps.ledger.json" --ledger "$T/l2.md" 2>&1)
+check "the ledger: a row written while its job ran is replaced by the final accounting once the job has ended, and only once" 'echo "$LOUT" | grep -q "1 row(s) refreshed with final accounting" && [ $(grep -c "^| 9002 |" "$T/l2.md") = 1 ] && grep -q "^| 9002 | alpha | .* | 4.0 | .* | COMPLETED |" "$T/l2.md"'
+printf '%s\n' "9002|alpha-r-v1|acct|gpu|1|billing=288,cpu=288,gres/gpu=4,node=1|7200|COMPLETED|2026-11-01T10:00:00|2026-11-01T12:00:00|288" > "$T/l2.sacct"
+python3 "$STAGE/slurm/ledger_from_sacct.py" --sacct-file "$T/l2.sacct" --caps "$T/caps.ledger.json" --ledger "$T/l2.md" >/dev/null 2>&1
+check "a final row is never rewritten: a later reading with another elapsed time leaves it as it was" 'grep -q "^| 9002 | alpha | .* | 4.0 | .* | COMPLETED |" "$T/l2.md" && [ $(grep -c "^| 9002 |" "$T/l2.md") = 1 ]'
+
+echo "32. the status screens (fleet_status.sh, jobs.sh), the copy-back helper (copyback.sh) and the budget table's cap column"
+reset; mkdir -p "$STAGE/receipts"
+job 2690001 1 R "(null)" None "2026-11-04T10:00:00" alpha-probe-v1; job 2690002 1 R "(null)" None "2026-11-04T10:00:00" alpha2-race-v1; job 2690003 1 PD "(null)" Priority "2026-11-04T10:00:00" alphax-e5-v1
+printf '%s\n' "2680001|alpha-probe-v0|booster|COMPLETED|600|billing=288,cpu=288,gres/gpu=4,node=1" "2680002|alpha2-race-v0|booster|FAILED|5400|billing=288,cpu=288,gres/gpu=4,node=1" \
+  "2680003|alpha-live-v1|booster|RUNNING|60|billing=288,cpu=288,gres/gpu=4,node=1" > "$FAKE/sacct.status.txt"
+H1=$(date -u -d '-1 hour' +%FT%TZ); H30=$(date -u -d '-30 hours' +%FT%TZ)
+printf '%s\n' "$H30 DONE job=2670009 name=alpha-old-v1 rc=0 receipt=r" "$H1 START job=2680001 name=alpha-probe-v0 node=n1 receipt=r" "$H1 DONE job=2680001 name=alpha-probe-v0 rc=0 receipt=r" \
+  "$H1 FAILED job=2680002 name=alpha2-race-v0 rc=1 receipt=r" > "$STAGE/receipts/JOBS.log"
+echo "2026-11-04T10:00:00Z|2690004|alpha-waiting-v1|1" > "$FLEET_QUEUE_FILE"
+JS(){ OUT=$(bash "$STAGE/slurm/jobs.sh" "$@" 2>&1); RC=$?; }
+FS(){ OUT=$(bash "$STAGE/slurm/fleet_status.sh" "$@" 2>&1); RC=$?; }
+sect(){ printf '%s\n' "$OUT" | awk -v h="$1" 'index($0, h) == 1 {on = 1; next} /^(==|##) / {on = 0} on'; }   # the lines of one section
+JS alpha
+check "jobs.sh alpha: the jobs whose names begin with the tag and a hyphen; alpha2's and alphax's are not shown, in the queue, accounting or receipts" '[ $RC = 0 ] && sect "== queue" | grep -q "^2690001  alpha-probe-v1 " && ! sect "== queue" | grep -q "alpha2\|alphax" && sect "== accounting" | grep -q " alpha-probe-v0 " && ! sect "== accounting" | grep -q alpha2 && sect "== receipts" | grep -q "name=alpha-probe-v0" && ! sect "== receipts" | grep -q "name=alpha2"'
+JS all
+check "jobs.sh all: every job in every section, the queue under its header, the billing field left out" '[ $RC = 0 ] && sect "== queue" | head -1 | grep -q "^JOBID    NAME " && [ $(sect "== queue" | grep -c "^26900") = 3 ] && [ $(sect "== accounting" | grep -c "^ 26800") = 3 ] && ! printf "%s" "$OUT" | grep -q "billing="'
+job 2690005 1 R "(null)" None "2026-11-04T10:00:00" small-a-v1; job 2690006 1 R "(null)" None "2026-11-04T10:00:00" smoke-b-v1; JS small
+check "a tag is matched as written, not as a pattern: small shows small-a-v1 and not smoke-b-v1" '[ $RC = 0 ] && sect "== queue" | grep -q " small-a-v1 " && ! sect "== queue" | grep -q smoke'
+rm -f "$FAKE/sacct_calls.txt"; JS --since 2026-11-01 alpha; A1=$RC; S1=$(printf '%s\n' "$OUT" | grep -c "^== accounting since 2026-11-01$")
+JS alpha 2026-11-01; A2=$RC; JS alpha --since 1.11.2026; A3=$RC; JS alpha --sinse 2026-11-01; A4=$RC
+check "--since before or after the tag, passed to accounting; a second tag, a date that is not YYYY-MM-DD and an unknown option refused (exit 2)" '[ $A1 = 0 ] && [ "$S1" = 1 ] && grep -q -- "--starttime 2026-11-01 " "$FAKE/sacct_calls.txt" && [ $A2 = 2 ] && [ $A3 = 2 ] && [ $A4 = 2 ]'
+touch "$FAKE/squeue_fail"; JS alpha; rm -f "$FAKE/squeue_fail"
+check "the queue cannot be read: jobs.sh says so in that section, still shows accounting and receipts, and exits 1" '[ $RC = 1 ] && sect "== queue" | grep -q "^(squeue failed, exit 1: not shown)$" && sect "== accounting" | grep -q alpha-probe-v0 && sect "== receipts" | grep -q alpha-probe-v0'
+touch "$FAKE/sacct_fail"; mv "$STAGE/receipts/JOBS.log" "$T/JOBS.saved"; JS alpha; mv "$T/JOBS.saved" "$STAGE/receipts/JOBS.log"; rm -f "$FAKE/sacct_fail"
+check "accounting cannot be read and no job log yet: jobs.sh says so for accounting, (none) for receipts, and still shows the queue; exit 1" '[ $RC = 1 ] && sect "== accounting" | grep -q "^(sacct failed, exit 1: not shown)$" && [ "$(sect "== receipts")" = "(none)" ] && sect "== queue" | grep -q alpha-probe-v1'
+FS --site test
+check "fleet_status.sh: all six sections, exit 0; the queue as squeue prints it" '[ $RC = 0 ] && [ $(printf "%s\n" "$OUT" | grep -c "^## ") = 6 ] && sect "## queue" | grep -q "^JOBID    NAME " && sect "## queue" | grep -q "^2690001  alpha-probe-v1 "'
+check "the jobs waiting for a node: the fleet queue the site file or the environment names (the one submit.sh and the dispatcher use), not the copy's own receipts folder" 'sect "## waiting" | grep -q "^2026-11-04T10:00:00Z|2690004|alpha-waiting-v1|1$" && [ ! -e "$STAGE/receipts/FLEET_QUEUE.log" ]'
+check "accounting: the jobs that finished, not the running one, without the billing field; receipts of the last 24 hours without START lines; the summary counts them" 'sect "## finished" | grep -q " alpha-probe-v0 .*COMPLETED" && sect "## finished" | grep -q " alpha2-race-v0 .*FAILED" && ! sect "## finished" | grep -q "alpha-live-v1\|billing=" && sect "## receipts" | grep -q "DONE job=2680001" && ! sect "## receipts" | grep -q " START \|alpha-old-v1" && sect "## summary" | grep -q "DONE=1" && sect "## summary" | grep -q "FAILED=1"'
+touch "$FAKE/squeue_fail"; FS --site test; rm -f "$FAKE/squeue_fail"
+check "the queue cannot be read: fleet_status.sh says so there and still shows the waiting list, accounting, receipts and summary; exit 1" '[ $RC = 1 ] && sect "## queue" | grep -q "^(squeue failed, exit 1: not shown)$" && sect "## waiting" | grep -q 2690004 && sect "## finished" | grep -q alpha-probe-v0 && [ $(printf "%s\n" "$OUT" | grep -c "^## ") = 6 ]'
+touch "$FAKE/sacct_fail"; FS --site test; rm -f "$FAKE/sacct_fail"
+check "accounting cannot be read: that section says so, receipts and summary still shown; exit 1" '[ $RC = 1 ] && sect "## finished" | grep -q "^(sacct failed, exit 1: not shown)$" && sect "## receipts" | grep -q "DONE job=2680001" && sect "## summary" | grep -q DONE=1'
+rm -f "$FAKE/squeue_calls.txt"; OUT=$(env -u USER bash "$STAGE/slurm/fleet_status.sh" --site test 2>&1); U1=$?; N1=$(printf '%s\n' "$OUT" | grep -c "^## "); OUT=$(env -u USER bash "$STAGE/slurm/jobs.sh" alpha 2>&1); U2=$?
+check "without USER in the environment (a cron job, a service): both screens run, for the account's own user" '[ $U1 = 0 ] && [ "$N1" = 6 ] && [ $U2 = 0 ] && grep -q -- "-u $(id -un) --Format" "$FAKE/squeue_calls.txt"'
+FS --site test --hour 48; B1=$RC; FS --site test --hours 1.5; B2=$RC; FS --site nosuchsite; B3=$RC; FS --site test --hours 48; B4=$RC
+check "fleet_status.sh: an unknown argument (--hour), hours that are not a whole number and a site without a site file refused (exit 2); --hours 48 shows 48 h" '[ $B1 = 2 ] && [ $B2 = 2 ] && [ $B3 = 2 ] && [ $B4 = 0 ] && printf "%s\n" "$OUT" | grep -q "^## finished in the last 48 h"'
+cp "$STAGE/caps.json" "$T/caps.saved"; python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["zero"]=0; json.dump(c,open(p,"w"),indent=1)' "$STAGE/caps.json"
+BT=$(python3 "$STAGE/slurm/budget.py" --site test 2>/dev/null); cp "$T/caps.saved" "$STAGE/caps.json"
+ZC=$(printf '%s\n' "$BT" | awk '$1 == "zero" {print $4}'); NC=$(printf '%s\n' "$BT" | awk '$1 == "alpha2" {print $4}')
+check "the budget table: a lane whose cap is 0 shows 0 under cap (it showed -, which reads as no cap); a lane with no cap still shows -" '[ "$ZC" = 0 ] && [ "$NC" = - ]'
+CB="$T/cb"; mkdir -p "$CB/remote/res/d/sub" "$CB/remote/res/e" "$CB/local" "$CB/local2" "$CB/local3"
+for f in res/a.txt res/b.txt res/d/one res/d/sub/deep res/e/two '#x' ';y'; do echo "$f" > "$CB/remote/$f"; done
+touch -d '2026-11-01 12:00:00' "$CB/remote/res/a.txt" "$CB/remote/res/b.txt"   # written on the remote before the list, as in use
+printf 'res/a.txt\nres/b.txt\n' > "$CB/list1.txt"
+cat > "$CB/rsh" <<'EOF'
+#!/bin/bash
+# rsync's remote shell for the test: drop ssh's options and the host, run the command on this machine
+while [ $# -gt 0 ]; do case "$1" in -l|-p|-o|-i|-F) shift 2;; -*) shift;; *) break;; esac; done
+shift; exec sh -c "$*"
+EOF
+chmod +x "$CB/rsh"
+cb(){ (cd "$CB" && RSYNC_RSH="$CB/rsh" bash "$STAGE/slurm/copyback.sh" "$@" > "$CB/cb.out" 2>&1); echo $?; }
+RC=$(cb user@host "$CB/remote" "$CB/local" "$CB/list1.txt"); M1=$(ls "$CB/local"/copyback-*.sha256 2>/dev/null | head -1)
+check "copyback.sh: two files written on the remote before the list: both pulled, and the manifest holds exactly their checksums, never itself" '[ "$RC" = 0 ] && [ -n "$M1" ] && [ "$(wc -l < "$M1")" = 2 ] && (cd "$CB/local" && sha256sum -c --quiet "$M1") && ! grep -q copyback- "$M1"'
+RC=$(cb user@host "$CB/remote" "$CB/local2" list1.txt); M2=$(ls "$CB/local2"/copyback-*.sha256 2>/dev/null | head -1)
+check "the list named by a relative path: exit 0, the same two checksums" '[ "$RC" = 0 ] && [ -n "$M2" ] && [ "$(wc -l < "$M2")" = 2 ] && (cd "$CB/local2" && sha256sum -c --quiet "$M2")'
+printf '#x\n\n;y\nres/a.txt\n/res/b.txt\nres/d/\nres/e\n' > "$CB/list3.txt"; RC=$(cb user@host "$CB/remote" "$CB/local3" "$CB/list3.txt"); M3=$(ls "$CB/local3"/copyback-*.sha256 2>/dev/null | head -1)
+GOT=$(cut -c67- "$M3" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '); HAVE=$(cd "$CB/local3" && find . -type f ! -name 'copyback-*' | sed 's#^\./##' | LC_ALL=C sort | tr '\n' ' ')
+check "the list read as rsync reads it in a pull (names that start with # or ;, a blank line, a leading slash, folder/ and folder): the manifest names exactly the files rsync brought" '[ "$RC" = 0 ] && [ "$GOT" = "$HAVE" ] && [ "$HAVE" = "#x ;y res/a.txt res/b.txt res/d/one " ]'
+RC1=$(cb user@host "$CB/remote" "$CB/local"); RC2=$(cb user@host "$CB/remote" "$CB/local4" "$CB/nolist.txt")
+check "copyback.sh with three arguments, or with a list that does not exist: exit 2, nothing pulled" '[ "$RC1" = 2 ] && [ "$RC2" = 2 ] && [ ! -e "$CB/local4" ]'
+
+echo "33. the login-node load check: tests/fleet_guard/test_login_check.sh"
 if TMPDIR="$T" bash "$HERE/test_login_check.sh" "$TOOLING/tools/login_check.py" > "$T/lc.out" 2>&1; then ok "login check suite: $(tail -1 "$T/lc.out")"; else bad "login check suite: $(tail -1 "$T/lc.out")"; cat "$T/lc.out"; fi
 
 echo; echo "RESULT: $PASS passed, $FAILS failed"

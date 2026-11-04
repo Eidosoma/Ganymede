@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/fleet_guard/test_launcher.sh PACK_NODE_PY: the launcher's task shell under the forwarded checkpoint signal (a single command, a
 # compound one, a program started with & that saves at once, and a program that does not handle the signal; a CPU pool under the
-# signal), and a task that cannot be started (a missing folder, refused before
+# signal; a spec that would leave a GPU idle, and a pool file that cannot be read), and a task that cannot be started (a missing folder, refused before
 # anything starts; a start that fails after others have started). Fake mode: nothing here touches a GPU, Slurm or a live receipt.
 PN="$(readlink -f "${1:-}")"; [ -n "$PN" ] && [ -f "$PN" ] || { echo "usage: test_launcher.sh <pack_node.py>"; exit 2; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/launcher_test.XXXXXX")
@@ -142,4 +142,17 @@ echo "K13. a pool command gets PACK_RECEIPT_DIR, as tasks do (the third review: 
 printf '%s\n' "python3 -c \"import os; open(os.environ['PACK_RECEIPT_DIR'] + '/pool-saw-it', 'w').write('ok')\"" > "$T/p4.cmds"; pspec p4 p4.cmds
 (cd "$T" && exec python3 "$PN" --spec "$T/p4.json" --receipt-dir "$T/p4" --mode cpu --reserve-cores 0 --grace 5 >"$T/p4.out" 2>"$T/p4.err"); RC=$?
 check "exit 0; the command ran with it: its file is in the receipt folder; one completed, none failed" '[ "$RC" = 0 ] && [ -e "$T/p4/pool-saw-it" ] && [ "$(rj "$T/p4/receipt.json" "r[\"pools\"][0][\"failed\"]==0 and r[\"pools\"][0][\"completed\"]==1")" = True ]'
+echo "K14. the packing rule: a spec that would leave a GPU idle is refused before anything starts"
+spec c14 "$T|python3 $T/fg.py"
+(cd "$T" && READY="$T/c14.ready" exec python3 "$PN" --spec "$T/c14.json" --receipt-dir "$T/c14" --mode fake --fake-gpus 2 --reserve-cores 0 --grace 5 >"$T/c14.out" 2>"$T/c14.err"); RC=$?
+check "one GPU task for two slots: exit 2, REFUSED by the packing rule, nothing started, no receipt" '[ "$RC" = 2 ] && grep -q "REFUSED by the packing rule: 1 GPU tasks for 2 GPU slots" "$T/c14.err" && [ ! -e "$T/c14.ready" ] && [ ! -e "$T/c14/receipt.json" ]'
+(cd "$T" && READY="$T/c14.ready" exec python3 "$PN" --spec "$T/c14.json" --receipt-dir "$T/c14" --mode fake --fake-gpus 2 --reserve-cores 0 --grace 5 --allow-partial >"$T/c14.out" 2>"$T/c14.err"); RC=$?
+check "--allow-partial without a written reason: refused, nothing started" '[ "$RC" != 0 ] && grep -q "allow-partial needs --reason" "$T/c14.err" && [ ! -e "$T/c14.ready" ]'
+spec c14b "$T|true"
+(cd "$T" && exec python3 "$PN" --spec "$T/c14b.json" --receipt-dir "$T/c14b" --mode fake --fake-gpus 2 --reserve-cores 0 --grace 5 --allow-partial --reason "a test of the exception" >"$T/c14b.out" 2>"$T/c14b.err"); RC=$?
+check "--allow-partial with a reason: it runs, exit 0, the reason in the receipt" '[ "$RC" = 0 ] && grep -q "a test of the exception" "$T/c14b/receipt.json"'
+echo "K15. a CPU pool whose command file cannot be read: refused before anything starts"
+pspec p5 no-such-file.cmds
+(cd "$T" && exec python3 "$PN" --spec "$T/p5.json" --receipt-dir "$T/p5" --mode cpu --reserve-cores 0 --grace 5 >"$T/p5.out" 2>"$T/p5.err"); RC=$?
+check "exit 2, the pool and the reason named, no receipt" '[ "$RC" = 2 ] && grep -q "REFUSED: cpu_pool p: its command file cannot be read" "$T/p5.err" && [ ! -e "$T/p5/receipt.json" ]'
 echo "LAUNCHER RESULT: $PASS passed, $FAILS failed"; [ "$FAILS" = 0 ]

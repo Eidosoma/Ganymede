@@ -2,8 +2,26 @@
 # fake squeue over $FAKE/jobs.txt: A|F|D|t|E|r|V|j|l|M  (unique id|base id|nodes|state|dependency|reason|submit|name|limit|elapsed)
 [ -d "$FAKE" ] && echo "BITSTR=${SLURM_BITSTR_LEN-unset} $*" >> "$FAKE/squeue_calls.txt"   # each call, with the task-list length setting
 [ -e "$FAKE/squeue_fail" ] && { echo "slurm_load_jobs error: Socket timed out" >&2; exit 1; }
-FMT='%i'; STATES='PD,R,CF,CG'; IDS=''; R=0
-while [ $# -gt 0 ]; do case "$1" in -o) FMT="$2"; shift 2;; -t) STATES="$2"; shift 2;; -j) IDS="$2"; shift 2;; -r) R=1; shift;; -A|-u|-n) shift 2;; *) shift;; esac; done
+FMT='%i'; STATES='PD,R,CF,CG'; IDS=''; R=0; LONG=''; HDR=1
+while [ $# -gt 0 ]; do case "$1" in -o) FMT="$2"; shift 2;; -O|--Format) LONG="$2"; shift 2;; --Format=*) LONG="${1#--Format=}"; shift;; -h|--noheader) HDR=0; shift;; -t) STATES="$2"; shift 2;; -j) IDS="$2"; shift 2;; -r) R=1; shift;; -A|-u|-n) shift 2;; *) shift;; esac; done
+if [ -n "$LONG" ]; then
+  # -O/--Format as Slurm 25.05 prints it (src/squeue/print.c, _print_str): each field cut to its width and padded to it, with no
+  # separator; 20 wide when no width is given; a header first unless -h. JobId is the job's own id (a collapsed pending array shows
+  # its base id); the partition, the CPUs and the TRES are fixed values here.
+  IFS=, read -r -a FIELDS <<< "$LONG"
+  col(){ printf '%-*.*s' "$2" "$2" "$1"; }
+  head_of(){ case "$1" in jobid) echo JOBID;; name) echo NAME;; partition) echo PARTITION;; statecompact) echo ST;; timeused) echo TIME;; timelimit) echo TIME_LIMIT;; numcpus) echo CPUS;; tres-per-node) echo TRES_PER_NODE;; reason) echo REASON;; *) echo "${1^^}";; esac; }
+  value_of(){ case "$1" in jobid) echo "${A%%_\[*}";; name) echo "$j";; partition) echo booster;; statecompact) echo "$t";; timeused) echo "$M";; timelimit) echo "$l";; numcpus) echo 288;; tres-per-node) echo gres/gpu:4;; reason) echo "$r";; *) echo;; esac; }
+  line(){ local f n w out=''; for f in "${FIELDS[@]}"; do n="${f%%:*}"; w=20; [ "$n" != "$f" ] && w="${f#*:}"; w="${w#.}"; out+=$(col "$("$1" "${n,,}")" "$w"); done; printf '%s\n' "$out"; }
+  [ "$HDR" = 1 ] && line head_of
+  [ -f "$FAKE/jobs.txt" ] || exit 0
+  while IFS='|' read -r A F D t E r V j l M; do
+    [ -n "$A" ] || continue
+    if [ "$STATES" != all ]; then case ",$STATES," in *",$t,"*) ;; *) continue;; esac; fi
+    line value_of
+  done < "$FAKE/jobs.txt"
+  exit 0
+fi
 [ -f "$FAKE/jobs.txt" ] || exit 0
 while IFS='|' read -r A F D t E r V j l M; do
   [ -n "$A" ] || continue
